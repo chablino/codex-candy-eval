@@ -47,7 +47,13 @@ def resolve_codex_executable() -> str:
     raise RuntimeError("找不到 codex 可执行文件，请确认已安装并加入 PATH。")
 
 
-def run_codex(model: str | None, effort: str):
+def run_codex(
+    model: str | None,
+    effort: str,
+    *,
+    environment: dict[str, str] | None = None,
+    redact=None,
+):
     exe = resolve_codex_executable()
 
     cmd = [
@@ -72,9 +78,15 @@ def run_codex(model: str | None, effort: str):
         text=True,
         encoding="utf-8",
         errors="replace",
+        env=environment,
     )
     if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "codex exec failed")
+        stderr = proc.stderr or ""
+        stdout = proc.stdout or ""
+        if redact is not None:
+            stderr = redact(stderr)
+            stdout = redact(stdout)
+        raise RuntimeError(stderr.strip() or stdout.strip() or "codex exec failed")
 
     # codex --json emits one JSON event per line. The final answer is the last
     # `agent_message` item; token usage (incl. reasoning) is in `turn.completed`.
@@ -202,8 +214,7 @@ def setup_console() -> bool:
     return True
 
 
-def main() -> None:
-    use_ansi = setup_console()
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-m", "--model", help="Codex model name; omit for the local default.")
     parser.add_argument(
@@ -211,7 +222,17 @@ def main() -> None:
         choices=["low", "medium", "high", "xhigh", "max", "ultra"],
     )
     parser.add_argument("-n", "--tests", type=int, default=1)
-    args = parser.parse_args()
+    parser.add_argument(
+        "--cc-switch-config",
+        metavar="NAME_OR_ID",
+        help="CC Switch Codex config name or ID; does not change the App selection.",
+    )
+    return parser.parse_args(argv)
+
+
+def _evaluate(args, use_ansi: bool, runtime) -> None:
+    environment = runtime.environment if runtime is not None else None
+    redactor = runtime.redact if runtime is not None else None
 
     headers = ["Run", "Codex", "In Tok", "Out Tok", "Reason Tok", "Time(s)", "TPS", "OK"]
     aligns = ["right", "left", "right", "right", "right", "right", "right", "center"]
@@ -219,7 +240,12 @@ def main() -> None:
     def run_one(index: int) -> tuple[list, bool | None]:
         try:
             start = time.perf_counter()
-            text, in_tok, out_tok, rea_tok = run_codex(args.model, args.reasoning_effort)
+            text, in_tok, out_tok, rea_tok = run_codex(
+                args.model,
+                args.reasoning_effort,
+                environment=environment,
+                redact=redactor,
+            )
             elapsed = time.perf_counter() - start
             tps = out_tok / elapsed if out_tok and elapsed > 0 else None
             ok = bool(ANSWER_PATTERN.search(text))
@@ -256,5 +282,32 @@ def main() -> None:
           if graded else f"\nGraded 0/{args.tests}")
 
 
+def main(argv=None) -> int:
+    use_ansi = setup_console()
+    args = parse_args(argv)
+    if args.cc_switch_config is None:
+        _evaluate(args, use_ansi, None)
+        return 0
+
+    try:
+        from cc_switch_config import CcSwitchConfigError, use_provider
+    except ModuleNotFoundError as exc:
+        if exc.name != "cc_switch_config":
+            raise
+        print(
+            "ERROR: --cc-switch-config requires the complete repository",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        with use_provider("codex", args.cc_switch_config) as runtime:
+            _evaluate(args, use_ansi, runtime)
+    except CcSwitchConfigError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
