@@ -5,7 +5,7 @@ import sqlite3
 import stat
 import tempfile
 import unittest
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -550,6 +550,55 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
         self.assertEqual(installed[0][0], signal.SIGTERM)
         self.assertEqual(installed[1], (signal.SIGTERM, previous))
+
+    def test_use_provider_installs_sigterm_handler_before_materialization(self):
+        provider = SelectedProvider("id", "claude", "provider", {"env": {}})
+        previous = object()
+        current_handler = {"value": previous}
+
+        def fake_signal(_signum, handler):
+            current_handler["value"] = handler
+
+        @contextmanager
+        def interrupt_during_materialization(_provider):
+            current_handler["value"](signal.SIGTERM, None)
+            yield  # pragma: no cover
+
+        with mock.patch.object(
+            cc_switch_config, "load_provider", return_value=provider
+        ) as load, mock.patch.object(
+            cc_switch_config, "materialize_provider", interrupt_during_materialization
+        ), mock.patch.object(
+            cc_switch_config.signal, "getsignal", return_value=previous
+        ), mock.patch.object(
+            cc_switch_config.signal, "signal", side_effect=fake_signal
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                with use_provider("claude", "provider", Path("unused.db")):
+                    pass
+
+        self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+        self.assertIs(current_handler["value"], previous)
+        load.assert_called_once_with("claude", "provider", Path("unused.db"))
+
+    def test_use_provider_sigterm_cleans_runtime(self):
+        provider = SelectedProvider("id", "claude", "provider", {"env": {}})
+        previous = signal.getsignal(signal.SIGTERM)
+        root = None
+
+        with mock.patch.object(
+            cc_switch_config, "load_provider", return_value=provider
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                with use_provider("claude", "provider") as runtime:
+                    root = Path(runtime.environment["CLAUDE_CONFIG_DIR"])
+                    handler = signal.getsignal(signal.SIGTERM)
+                    handler(signal.SIGTERM, None)
+
+        self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+        self.assertIsNotNone(root)
+        self.assertFalse(root.exists())
+        self.assertEqual(signal.getsignal(signal.SIGTERM), previous)
 
     def test_use_provider_rejects_windows_before_database_access(self):
         with mock.patch.object(cc_switch_config.os, "name", "nt"), mock.patch.object(

@@ -395,8 +395,8 @@ def use_provider(
         )
 
     provider = load_provider(app_type, selector, db_path)
-    with materialize_provider(provider) as runtime:
-        with _sigterm_as_system_exit():
+    with _sigterm_as_system_exit():
+        with materialize_provider(provider) as runtime:
             yield runtime
 
 
