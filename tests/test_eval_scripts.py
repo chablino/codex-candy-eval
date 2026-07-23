@@ -8,6 +8,8 @@ from unittest import mock
 import cc_switch_config
 import claude_candy_eval
 import codex_candy_eval
+import codex_juice_eval
+import codex_tps_eval
 
 
 class CodexCandyTests(unittest.TestCase):
@@ -242,6 +244,162 @@ class ClaudeCandyTests(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertIn("bad selector", errors.getvalue())
         run.assert_not_called()
+
+
+class CodexTpsTests(unittest.TestCase):
+    def test_parser_accepts_selector_and_model(self):
+        args = codex_tps_eval.parse_args(
+            ["--cc-switch-config", "anyrouter", "-m", "gpt-test", "-r", "high"]
+        )
+
+        self.assertEqual(
+            (args.cc_switch_config, args.model, args.reasoning_effort),
+            ("anyrouter", "gpt-test", "high"),
+        )
+
+    def test_subprocess_receives_runtime_and_redacts_error(self):
+        environment = {"CODEX_HOME": "/private/runtime"}
+        with mock.patch.object(
+            codex_tps_eval.shutil, "which", return_value="codex"
+        ), mock.patch.object(
+            codex_tps_eval.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 1, "", "secret-token"),
+        ) as run:
+            with self.assertRaisesRegex(RuntimeError, "<redacted>"):
+                codex_tps_eval.run_codex(
+                    "prompt",
+                    "gpt-test",
+                    "medium",
+                    environment=environment,
+                    redact=lambda text: text.replace("secret-token", "<redacted>"),
+                )
+
+        self.assertIs(run.call_args.kwargs["env"], environment)
+
+    def test_selector_uses_one_context_for_all_questions(self):
+        runtime = SimpleNamespace(
+            environment={"CODEX_HOME": "/private/runtime"},
+            redact=lambda text: text.replace("secret", "<redacted>"),
+        )
+        context_calls = []
+        run_calls = []
+
+        @contextmanager
+        def fake_use_provider(app_type, selector, db_path=cc_switch_config.DEFAULT_DB_PATH):
+            context_calls.append((app_type, selector, db_path))
+            yield runtime
+
+        def fake_run_codex(prompt, model, effort, *, environment=None, redact=None):
+            run_calls.append((prompt, model, effort, environment, redact))
+            return ("answer", 10, 20, 5)
+
+        with mock.patch.object(
+            cc_switch_config, "use_provider", side_effect=fake_use_provider
+        ), mock.patch.object(
+            codex_tps_eval, "run_codex", side_effect=fake_run_codex
+        ), mock.patch.object(codex_tps_eval, "setup_console", return_value=False), redirect_stdout(
+            io.StringIO()
+        ):
+            result = codex_tps_eval.main(
+                ["--cc-switch-config", "anyrouter", "-m", "gpt-test"]
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(context_calls, [("codex", "anyrouter", cc_switch_config.DEFAULT_DB_PATH)])
+        self.assertEqual(len(run_calls), len(codex_tps_eval.QUESTIONS))
+        self.assertEqual(len(run_calls), 5)
+        self.assertTrue(all(call[3] is runtime.environment for call in run_calls))
+        self.assertTrue(all(call[4] is runtime.redact for call in run_calls))
+
+    def test_no_selector_does_not_load_cc_switch_provider(self):
+        with mock.patch.object(codex_tps_eval, "setup_console", return_value=False), mock.patch.object(
+            codex_tps_eval, "run_codex", return_value=("answer", 10, 20, 5)
+        ), mock.patch.object(cc_switch_config, "load_provider") as load, redirect_stdout(
+            io.StringIO()
+        ):
+            result = codex_tps_eval.main(["-m", "gpt-test"])
+
+        self.assertEqual(result, 0)
+        load.assert_not_called()
+
+
+class CodexJuiceTests(unittest.TestCase):
+    def test_parser_accepts_selector_and_model(self):
+        args = codex_juice_eval.parse_args(
+            ["--cc-switch-config", "anyrouter", "-m", "gpt-test"]
+        )
+
+        self.assertEqual(
+            (args.cc_switch_config, args.model), ("anyrouter", "gpt-test")
+        )
+
+    def test_subprocess_receives_runtime_and_redacts_error(self):
+        environment = {"CODEX_HOME": "/private/runtime"}
+        with mock.patch.object(
+            codex_juice_eval.shutil, "which", return_value="codex"
+        ), mock.patch.object(
+            codex_juice_eval.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 1, "", "secret-token"),
+        ) as run:
+            with self.assertRaisesRegex(RuntimeError, "<redacted>"):
+                codex_juice_eval.ask(
+                    "gpt-test",
+                    "medium",
+                    environment=environment,
+                    redact=lambda text: text.replace("secret-token", "<redacted>"),
+                )
+
+        self.assertIs(run.call_args.kwargs["env"], environment)
+
+    def test_selector_uses_one_context_for_all_efforts(self):
+        runtime = SimpleNamespace(
+            environment={"CODEX_HOME": "/private/runtime"},
+            redact=lambda text: text.replace("secret", "<redacted>"),
+        )
+        context_calls = []
+        ask_calls = []
+
+        @contextmanager
+        def fake_use_provider(app_type, selector, db_path=cc_switch_config.DEFAULT_DB_PATH):
+            context_calls.append((app_type, selector, db_path))
+            yield runtime
+
+        def fake_ask(model, effort, *, environment=None, redact=None):
+            ask_calls.append((model, effort, environment, redact))
+            return "1.25"
+
+        with mock.patch.object(
+            cc_switch_config, "use_provider", side_effect=fake_use_provider
+        ), mock.patch.object(
+            codex_juice_eval, "ask", side_effect=fake_ask
+        ), mock.patch.object(
+            codex_juice_eval, "MODEL_EFFORTS", {"gpt-test": ("low", "high")}
+        ), redirect_stdout(io.StringIO()):
+            result = codex_juice_eval.main(
+                ["--cc-switch-config", "anyrouter", "-m", "gpt-test"]
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(context_calls, [("codex", "anyrouter", cc_switch_config.DEFAULT_DB_PATH)])
+        self.assertEqual(
+            [(call[0], call[1]) for call in ask_calls],
+            [("gpt-test", "low"), ("gpt-test", "high")],
+        )
+        self.assertTrue(all(call[2] is runtime.environment for call in ask_calls))
+        self.assertTrue(all(call[3] is runtime.redact for call in ask_calls))
+
+    def test_no_selector_does_not_load_cc_switch_provider(self):
+        with mock.patch.object(codex_juice_eval, "ask", return_value="1.25"), mock.patch.object(
+            codex_juice_eval, "MODEL_EFFORTS", {"gpt-test": ("low",)}
+        ), mock.patch.object(cc_switch_config, "load_provider") as load, redirect_stdout(
+            io.StringIO()
+        ):
+            result = codex_juice_eval.main(["-m", "gpt-test"])
+
+        self.assertEqual(result, 0)
+        load.assert_not_called()
 
 
 if __name__ == "__main__":
