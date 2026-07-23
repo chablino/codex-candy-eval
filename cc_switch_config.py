@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
+from uuid import uuid4
 
 
 AppType = Literal["codex", "claude"]
@@ -44,6 +45,14 @@ class ProviderRuntime:
 
     def redact(self, text: str) -> str:
         return redact_text(text, self.secrets)
+
+
+@dataclass(frozen=True)
+class CodexProfileRuntime:
+    provider_id: str
+    provider_name: str
+    profile_name: str
+    environment: Mapping[str, str] = field(repr=False)
 
 
 def _open_read_only(db_path: Path) -> sqlite3.Connection:
@@ -360,6 +369,131 @@ def materialize_provider(provider: SelectedProvider) -> Iterator[ProviderRuntime
             )
 
 
+_ENVIRONMENT_KEY_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def _codex_auth_environment(auth: object) -> dict[str, str]:
+    if not isinstance(auth, dict):
+        raise CcSwitchConfigError(
+            "Codex provider auth must contain environment-safe text keys and values"
+        )
+
+    environment: dict[str, str] = {}
+    for key, value in auth.items():
+        if (
+            not isinstance(key, str)
+            or _ENVIRONMENT_KEY_PATTERN.fullmatch(key) is None
+            or not isinstance(value, str)
+            or "\0" in value
+        ):
+            raise CcSwitchConfigError(
+                "Codex provider auth must contain environment-safe text keys and values"
+            )
+        environment[key] = value
+    return environment
+
+
+def _codex_home(environment: dict[str, str]) -> Path:
+    configured_home = environment.get("CODEX_HOME")
+    inspection_failed = False
+    is_directory = False
+    home: Path | None = None
+    try:
+        if configured_home is None:
+            home = Path.home() / ".codex"
+        elif configured_home:
+            home = Path(configured_home).expanduser()
+        if home is not None:
+            is_directory = home.is_dir()
+    except (OSError, RuntimeError):
+        inspection_failed = True
+
+    if inspection_failed or not is_directory or home is None:
+        raise CcSwitchConfigError(
+            "CODEX_HOME must refer to an existing directory"
+        )
+
+    environment["CODEX_HOME"] = str(home)
+    return home
+
+
+def _cleanup_codex_profile(profile_path: Path) -> bool:
+    try:
+        profile_path.unlink()
+    except FileNotFoundError:
+        return True
+    except BaseException:
+        return False
+    return True
+
+
+def _prepare_codex_profile(
+    provider: SelectedProvider,
+) -> tuple[Path, CodexProfileRuntime]:
+    profile_path: Path | None = None
+    runtime: CodexProfileRuntime | None = None
+    setup_error: BaseException | None = None
+
+    try:
+        if provider.app_type != "codex":
+            raise CcSwitchConfigError(
+                "Codex profile runtime requires a codex provider"
+            )
+
+        auth_environment = _codex_auth_environment(provider.settings.get("auth"))
+        environment = os.environ.copy()
+        home = _codex_home(environment)
+        profile_name = f"cc-switch-{uuid4().hex}"
+        profile_path = home / f"{profile_name}.config.toml"
+        _write_private_file(profile_path, provider.settings.get("config"))
+
+        environment.update(auth_environment)
+        environment.setdefault("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "codex-tui")
+        runtime = CodexProfileRuntime(
+            provider_id=provider.provider_id,
+            provider_name=provider.name,
+            profile_name=profile_name,
+            environment=environment,
+        )
+    except BaseException as exc:
+        setup_error = exc
+
+    if setup_error is not None:
+        if profile_path is not None:
+            _cleanup_codex_profile(profile_path)
+        if isinstance(setup_error, (KeyboardInterrupt, SystemExit)):
+            raise setup_error
+        if isinstance(setup_error, CcSwitchConfigError):
+            raise setup_error
+        raise CcSwitchConfigError(
+            "failed to materialize selected Codex profile"
+        )
+
+    assert profile_path is not None
+    assert runtime is not None
+    return profile_path, runtime
+
+
+@contextmanager
+def materialize_codex_profile(
+    provider: SelectedProvider,
+) -> Iterator[CodexProfileRuntime]:
+    """Overlay one Codex provider without replacing the shared Codex home."""
+    profile_path, runtime = _prepare_codex_profile(provider)
+    body_failed = False
+    try:
+        yield runtime
+    except BaseException:
+        body_failed = True
+        raise
+    finally:
+        cleanup_succeeded = _cleanup_codex_profile(profile_path)
+        if not body_failed and not cleanup_succeeded:
+            raise CcSwitchConfigError(
+                "failed to clean up selected Codex profile"
+            )
+
+
 @contextmanager
 def _sigterm_as_system_exit() -> Iterator[None]:
     previous_handler = signal.getsignal(signal.SIGTERM)
@@ -397,6 +531,23 @@ def use_provider(
     provider = load_provider(app_type, selector, db_path)
     with _sigterm_as_system_exit():
         with materialize_provider(provider) as runtime:
+            yield runtime
+
+
+@contextmanager
+def use_codex_profile(
+    selector: str,
+    db_path: str | Path = DEFAULT_DB_PATH,
+) -> Iterator[CodexProfileRuntime]:
+    """Select one Codex provider while preserving shared Codex state."""
+    if os.name == "nt":
+        raise CcSwitchConfigError(
+            "--cc-switch-config is currently supported only on macOS/Linux"
+        )
+
+    provider = load_provider("codex", selector, db_path)
+    with _sigterm_as_system_exit():
+        with materialize_codex_profile(provider) as runtime:
             yield runtime
 
 

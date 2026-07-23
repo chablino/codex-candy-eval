@@ -12,13 +12,16 @@ from unittest import mock
 import cc_switch_config
 from cc_switch_config import (
     CcSwitchConfigError,
+    CodexProfileRuntime,
     ProviderRuntime,
     SelectedProvider,
     _sigterm_as_system_exit,
     _write_private_file,
     load_provider,
+    materialize_codex_profile,
     materialize_provider,
     redact_text,
+    use_codex_profile,
     use_provider,
 )
 
@@ -606,6 +609,286 @@ class RuntimeTests(unittest.TestCase):
         ) as load:
             with self.assertRaisesRegex(CcSwitchConfigError, "macOS/Linux"):
                 with use_provider("codex", "provider", Path("never.db")):
+                    pass
+
+        load.assert_not_called()
+
+
+class CodexProfileRuntimeTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.codex_home = self.root / "codex-home"
+        self.codex_home.mkdir()
+        self.provider = SelectedProvider(
+            "codex-id", "codex", "jianzhile", CODEX_SETTINGS
+        )
+
+    def profile_paths(self):
+        return list(self.codex_home.glob("cc-switch-*.config.toml"))
+
+    def test_profile_uses_shared_home_and_child_only_environment(self):
+        default_config = self.codex_home / "config.toml"
+        default_auth = self.codex_home / "auth.json"
+        session = self.codex_home / "sessions" / "shared-session.jsonl"
+        default_config.write_text("default-config\n", encoding="utf-8")
+        default_auth.write_text("default-auth\n", encoding="utf-8")
+        session.parent.mkdir()
+        session.write_text("shared-session\n", encoding="utf-8")
+        parent_environment = {
+            "CODEX_HOME": str(self.codex_home),
+            "CODEX_SQLITE_HOME": str(self.root / "sqlite-state"),
+            "OPENAI_API_KEY": "parent-secret",
+            "INHERITED_VALUE": "kept",
+        }
+
+        with mock.patch.dict(os.environ, parent_environment, clear=True):
+            with materialize_codex_profile(self.provider) as runtime:
+                profile_path = self.codex_home / (
+                    f"{runtime.profile_name}.config.toml"
+                )
+
+                self.assertIsInstance(runtime, CodexProfileRuntime)
+                self.assertRegex(runtime.profile_name, r"^cc-switch-[0-9a-f]{32}$")
+                self.assertEqual(
+                    profile_path.read_text(encoding="utf-8"),
+                    CODEX_SETTINGS["config"],
+                )
+                self.assertEqual(stat.S_IMODE(profile_path.stat().st_mode), 0o600)
+                self.assertEqual(
+                    runtime.environment["CODEX_HOME"], str(self.codex_home)
+                )
+                self.assertEqual(
+                    runtime.environment["CODEX_SQLITE_HOME"],
+                    str(self.root / "sqlite-state"),
+                )
+                self.assertEqual(runtime.environment["INHERITED_VALUE"], "kept")
+                self.assertEqual(
+                    runtime.environment["OPENAI_API_KEY"], "codex-test-secret"
+                )
+                self.assertEqual(
+                    runtime.environment["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"],
+                    "codex-tui",
+                )
+                self.assertEqual(dict(os.environ), parent_environment)
+                self.assertNotIn("codex-test-secret", repr(runtime))
+
+            self.assertFalse(profile_path.exists())
+            self.assertEqual(dict(os.environ), parent_environment)
+
+        self.assertEqual(default_config.read_text(encoding="utf-8"), "default-config\n")
+        self.assertEqual(default_auth.read_text(encoding="utf-8"), "default-auth\n")
+        self.assertEqual(session.read_text(encoding="utf-8"), "shared-session\n")
+
+    def test_explicit_originator_is_preserved(self):
+        environment = {
+            "CODEX_HOME": str(self.codex_home),
+            "CODEX_INTERNAL_ORIGINATOR_OVERRIDE": "custom-client",
+        }
+
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with materialize_codex_profile(self.provider) as runtime:
+                self.assertEqual(
+                    runtime.environment["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"],
+                    "custom-client",
+                )
+
+    def test_default_codex_home_is_shared_and_made_explicit_for_child(self):
+        default_home = self.root / ".codex"
+        default_home.mkdir()
+
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            cc_switch_config.Path, "home", return_value=self.root
+        ):
+            with materialize_codex_profile(self.provider) as runtime:
+                profile_path = default_home / f"{runtime.profile_name}.config.toml"
+                self.assertTrue(profile_path.is_file())
+                self.assertEqual(runtime.environment["CODEX_HOME"], str(default_home))
+
+        self.assertFalse(profile_path.exists())
+
+    def test_concurrent_profiles_are_unique_and_independently_cleaned(self):
+        with mock.patch.dict(
+            os.environ, {"CODEX_HOME": str(self.codex_home)}, clear=True
+        ):
+            with materialize_codex_profile(self.provider) as first:
+                first_path = self.codex_home / f"{first.profile_name}.config.toml"
+                with materialize_codex_profile(self.provider) as second:
+                    second_path = self.codex_home / f"{second.profile_name}.config.toml"
+                    self.assertNotEqual(first.profile_name, second.profile_name)
+                    self.assertTrue(first_path.is_file())
+                    self.assertTrue(second_path.is_file())
+
+                self.assertTrue(first_path.is_file())
+                self.assertFalse(second_path.exists())
+
+        self.assertFalse(first_path.exists())
+        self.assertEqual(self.profile_paths(), [])
+
+    def test_profile_is_cleaned_when_body_raises(self):
+        profile_path = None
+
+        with mock.patch.dict(
+            os.environ, {"CODEX_HOME": str(self.codex_home)}, clear=True
+        ):
+            with self.assertRaisesRegex(RuntimeError, "body failure"):
+                with materialize_codex_profile(self.provider) as runtime:
+                    profile_path = self.codex_home / (
+                        f"{runtime.profile_name}.config.toml"
+                    )
+                    raise RuntimeError("body failure")
+
+        self.assertIsNotNone(profile_path)
+        self.assertFalse(profile_path.exists())
+
+    def test_invalid_auth_is_rejected_before_profile_creation(self):
+        invalid_auth_values = (
+            {1: "value"},
+            {"": "value"},
+            {"BAD=KEY": "value"},
+            {"BAD\0KEY": "value"},
+            {"TOKEN": 1},
+            {"TOKEN": "secret\0value"},
+        )
+
+        with mock.patch.dict(
+            os.environ, {"CODEX_HOME": str(self.codex_home)}, clear=True
+        ):
+            for index, auth in enumerate(invalid_auth_values):
+                with self.subTest(index=index):
+                    provider = SelectedProvider(
+                        "id", "codex", "provider", {"config": "model=x", "auth": auth}
+                    )
+                    with self.assertRaises(CcSwitchConfigError) as raised:
+                        with materialize_codex_profile(provider):
+                            pass
+
+                    self.assertIn("auth", str(raised.exception))
+                    self.assertNotIn("secret", str(raised.exception))
+                    self.assertIsNone(raised.exception.__cause__)
+                    self.assertIsNone(raised.exception.__context__)
+                    self.assertEqual(self.profile_paths(), [])
+
+    def test_invalid_codex_home_is_rejected_without_creating_it(self):
+        missing = self.root / "missing-home"
+        regular_file = self.root / "not-a-directory"
+        regular_file.write_text("state\n", encoding="utf-8")
+
+        for invalid_home in (missing, regular_file):
+            with self.subTest(path=invalid_home), mock.patch.dict(
+                os.environ, {"CODEX_HOME": str(invalid_home)}, clear=True
+            ):
+                with self.assertRaises(CcSwitchConfigError) as raised:
+                    with materialize_codex_profile(self.provider):
+                        pass
+
+                self.assertIn("CODEX_HOME", str(raised.exception))
+                self.assertIsNone(raised.exception.__cause__)
+                self.assertIsNone(raised.exception.__context__)
+
+        self.assertFalse(missing.exists())
+        self.assertTrue(regular_file.is_file())
+
+    def test_partial_profile_is_removed_after_sanitized_setup_failure(self):
+        token = "profile-setup-secret"
+
+        def fail_after_write(path, content):
+            path.write_text(content, encoding="utf-8")
+            raise OSError(token)
+
+        with mock.patch.dict(
+            os.environ, {"CODEX_HOME": str(self.codex_home)}, clear=True
+        ), mock.patch.object(
+            cc_switch_config, "_write_private_file", side_effect=fail_after_write
+        ):
+            with self.assertRaises(CcSwitchConfigError) as raised:
+                with materialize_codex_profile(self.provider):
+                    pass
+
+        self.assertNotIn(token, str(raised.exception))
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+        self.assertEqual(self.profile_paths(), [])
+
+    def test_cleanup_only_failure_is_sanitized_without_exception_chain(self):
+        token = "profile-cleanup-secret"
+        real_unlink = Path.unlink
+
+        def fail_after_unlink(path, *args, **kwargs):
+            real_unlink(path, *args, **kwargs)
+            raise OSError(token)
+
+        with mock.patch.dict(
+            os.environ, {"CODEX_HOME": str(self.codex_home)}, clear=True
+        ), mock.patch.object(
+            cc_switch_config.Path,
+            "unlink",
+            autospec=True,
+            side_effect=fail_after_unlink,
+        ):
+            with self.assertRaises(CcSwitchConfigError) as raised:
+                with materialize_codex_profile(self.provider):
+                    pass
+
+        self.assertNotIn(token, str(raised.exception))
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+        self.assertEqual(self.profile_paths(), [])
+
+    def test_body_exception_wins_when_profile_cleanup_also_fails(self):
+        body_error = KeyboardInterrupt("body interrupt")
+        real_unlink = Path.unlink
+
+        def fail_after_unlink(path, *args, **kwargs):
+            real_unlink(path, *args, **kwargs)
+            raise OSError("cleanup failure")
+
+        with mock.patch.dict(
+            os.environ, {"CODEX_HOME": str(self.codex_home)}, clear=True
+        ), mock.patch.object(
+            cc_switch_config.Path,
+            "unlink",
+            autospec=True,
+            side_effect=fail_after_unlink,
+        ):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                with materialize_codex_profile(self.provider):
+                    raise body_error
+
+        self.assertIs(raised.exception, body_error)
+        self.assertEqual(self.profile_paths(), [])
+
+    def test_use_codex_profile_selects_codex_and_sigterm_cleans_profile(self):
+        previous = signal.getsignal(signal.SIGTERM)
+        profile_path = None
+        database_path = self.root / "unused.db"
+
+        with mock.patch.dict(
+            os.environ, {"CODEX_HOME": str(self.codex_home)}, clear=True
+        ), mock.patch.object(
+            cc_switch_config, "load_provider", return_value=self.provider
+        ) as load:
+            with self.assertRaises(SystemExit) as raised:
+                with use_codex_profile("jianzhile", database_path) as runtime:
+                    profile_path = self.codex_home / (
+                        f"{runtime.profile_name}.config.toml"
+                    )
+                    handler = signal.getsignal(signal.SIGTERM)
+                    handler(signal.SIGTERM, None)
+
+        self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+        self.assertIsNotNone(profile_path)
+        self.assertFalse(profile_path.exists())
+        self.assertEqual(signal.getsignal(signal.SIGTERM), previous)
+        load.assert_called_once_with("codex", "jianzhile", database_path)
+
+    def test_use_codex_profile_rejects_windows_before_database_access(self):
+        with mock.patch.object(cc_switch_config.os, "name", "nt"), mock.patch.object(
+            cc_switch_config, "load_provider"
+        ) as load:
+            with self.assertRaisesRegex(CcSwitchConfigError, "macOS/Linux"):
+                with use_codex_profile("provider", Path("never.db")):
                     pass
 
         load.assert_not_called()
