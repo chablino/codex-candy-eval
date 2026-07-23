@@ -71,6 +71,10 @@ def run_codex(
 
     # 多行题目通过 stdin 传入：作为命令行参数时，经 cmd.exe/codex.cmd 包装后换行会被
     # 吞掉，而管道里的内容能完整保留。codex exec 在无位置参数且 stdin 非 TTY 时读 stdin。
+    child_environment = (
+        dict(environment) if environment is not None else os.environ.copy()
+    )
+    child_environment.setdefault("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "codex-tui")
     proc = subprocess.run(
         cmd,
         input=CODEX_PROMPT,
@@ -78,7 +82,7 @@ def run_codex(
         text=True,
         encoding="utf-8",
         errors="replace",
-        env=environment,
+        env=child_environment,
     )
     if proc.returncode != 0:
         stderr = proc.stderr or ""

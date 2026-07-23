@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -29,12 +30,16 @@ def ask(
     exe = shutil.which("codex")
     if not exe:
         raise RuntimeError("codex executable not found")
+    child_environment = (
+        dict(environment) if environment is not None else os.environ.copy()
+    )
+    child_environment.setdefault("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "codex-tui")
     proc = subprocess.run(
         [exe, "exec", "--json", "--skip-git-repo-check", "--ephemeral",
          "-s", "read-only", "--disable", "memories", "-m", model,
          "-c", f"model_reasoning_effort={effort}"],
         input=PROMPT, capture_output=True, text=True, encoding="utf-8",
-        env=environment,
+        env=child_environment,
     )
     if proc.returncode:
         stderr = proc.stderr or ""

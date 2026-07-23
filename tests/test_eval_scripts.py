@@ -1,4 +1,5 @@
 import io
+import os
 import subprocess
 import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
@@ -40,7 +41,53 @@ class CodexCandyTests(unittest.TestCase):
                     redact=lambda text: text.replace("secret-token", "<redacted>"),
                 )
 
-        self.assertIs(run.call_args.kwargs["env"], environment)
+        child_environment = run.call_args.kwargs["env"]
+        self.assertIsNot(child_environment, environment)
+        self.assertEqual(child_environment["CODEX_HOME"], "/private/runtime")
+        self.assertEqual(
+            child_environment["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"], "codex-tui"
+        )
+        self.assertEqual(environment, {"CODEX_HOME": "/private/runtime"})
+
+    def test_subprocess_preserves_explicit_originator(self):
+        environment = {
+            "CODEX_HOME": "/private/runtime",
+            "CODEX_INTERNAL_ORIGINATOR_OVERRIDE": "custom-client",
+        }
+        with mock.patch.object(
+            codex_candy_eval, "resolve_codex_executable", return_value="codex"
+        ), mock.patch.object(
+            codex_candy_eval.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 1, "", "failed"),
+        ) as run:
+            with self.assertRaises(RuntimeError):
+                codex_candy_eval.run_codex(None, "medium", environment=environment)
+
+        child_environment = run.call_args.kwargs["env"]
+        self.assertEqual(
+            child_environment["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"], "custom-client"
+        )
+        self.assertEqual(child_environment["CODEX_HOME"], "/private/runtime")
+        self.assertEqual(child_environment, environment)
+        self.assertIsNot(child_environment, environment)
+
+    def test_subprocess_inherits_parent_environment_when_no_runtime_is_supplied(self):
+        with mock.patch.dict(os.environ, {"CODEX_PARENT_ENV": "inherited"}, clear=True), mock.patch.object(
+            codex_candy_eval, "resolve_codex_executable", return_value="codex"
+        ), mock.patch.object(
+            codex_candy_eval.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 1, "", "failed"),
+        ) as run:
+            with self.assertRaises(RuntimeError):
+                codex_candy_eval.run_codex(None, "medium")
+
+        child_environment = run.call_args.kwargs["env"]
+        self.assertEqual(child_environment["CODEX_PARENT_ENV"], "inherited")
+        self.assertEqual(
+            child_environment["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"], "codex-tui"
+        )
 
     def test_error_uses_redacted_stdout_when_stderr_is_whitespace(self):
         with mock.patch.object(
@@ -151,6 +198,7 @@ class ClaudeCandyTests(unittest.TestCase):
                 )
 
         self.assertIs(run.call_args.kwargs["env"], environment)
+        self.assertNotIn("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", environment)
 
     def test_json_error_result_is_redacted(self):
         response = '{"is_error":true,"result":"failed with secret-token"}'
@@ -275,7 +323,56 @@ class CodexTpsTests(unittest.TestCase):
                     redact=lambda text: text.replace("secret-token", "<redacted>"),
                 )
 
-        self.assertIs(run.call_args.kwargs["env"], environment)
+        child_environment = run.call_args.kwargs["env"]
+        self.assertIsNot(child_environment, environment)
+        self.assertEqual(child_environment["CODEX_HOME"], "/private/runtime")
+        self.assertEqual(
+            child_environment["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"], "codex-tui"
+        )
+        self.assertEqual(environment, {"CODEX_HOME": "/private/runtime"})
+
+    def test_subprocess_preserves_explicit_originator(self):
+        environment = {
+            "CODEX_HOME": "/private/runtime",
+            "CODEX_INTERNAL_ORIGINATOR_OVERRIDE": "custom-client",
+        }
+        with mock.patch.object(
+            codex_tps_eval.shutil, "which", return_value="codex"
+        ), mock.patch.object(
+            codex_tps_eval.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 1, "", "failed"),
+        ) as run:
+            with self.assertRaises(RuntimeError):
+                codex_tps_eval.run_codex(
+                    "prompt", "gpt-test", "medium", environment=environment
+                )
+
+        child_environment = run.call_args.kwargs["env"]
+        self.assertEqual(
+            child_environment["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"], "custom-client"
+        )
+        self.assertEqual(child_environment, environment)
+        self.assertIsNot(child_environment, environment)
+
+    def test_subprocess_inherits_parent_environment_when_no_runtime_is_supplied(self):
+        with mock.patch.dict(
+            os.environ, {"CODEX_PARENT_ENV": "inherited"}, clear=True
+        ), mock.patch.object(
+            codex_tps_eval.shutil, "which", return_value="codex"
+        ), mock.patch.object(
+            codex_tps_eval.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 1, "", "failed"),
+        ) as run:
+            with self.assertRaises(RuntimeError):
+                codex_tps_eval.run_codex("prompt", "gpt-test", "medium")
+
+        child_environment = run.call_args.kwargs["env"]
+        self.assertEqual(child_environment["CODEX_PARENT_ENV"], "inherited")
+        self.assertEqual(
+            child_environment["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"], "codex-tui"
+        )
 
     def test_selector_uses_one_context_for_all_questions(self):
         runtime = SimpleNamespace(
@@ -351,7 +448,54 @@ class CodexJuiceTests(unittest.TestCase):
                     redact=lambda text: text.replace("secret-token", "<redacted>"),
                 )
 
-        self.assertIs(run.call_args.kwargs["env"], environment)
+        child_environment = run.call_args.kwargs["env"]
+        self.assertIsNot(child_environment, environment)
+        self.assertEqual(child_environment["CODEX_HOME"], "/private/runtime")
+        self.assertEqual(
+            child_environment["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"], "codex-tui"
+        )
+        self.assertEqual(environment, {"CODEX_HOME": "/private/runtime"})
+
+    def test_subprocess_preserves_explicit_originator(self):
+        environment = {
+            "CODEX_HOME": "/private/runtime",
+            "CODEX_INTERNAL_ORIGINATOR_OVERRIDE": "custom-client",
+        }
+        with mock.patch.object(
+            codex_juice_eval.shutil, "which", return_value="codex"
+        ), mock.patch.object(
+            codex_juice_eval.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 1, "", "failed"),
+        ) as run:
+            with self.assertRaises(RuntimeError):
+                codex_juice_eval.ask("gpt-test", "medium", environment=environment)
+
+        child_environment = run.call_args.kwargs["env"]
+        self.assertEqual(
+            child_environment["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"], "custom-client"
+        )
+        self.assertEqual(child_environment, environment)
+        self.assertIsNot(child_environment, environment)
+
+    def test_subprocess_inherits_parent_environment_when_no_runtime_is_supplied(self):
+        with mock.patch.dict(
+            os.environ, {"CODEX_PARENT_ENV": "inherited"}, clear=True
+        ), mock.patch.object(
+            codex_juice_eval.shutil, "which", return_value="codex"
+        ), mock.patch.object(
+            codex_juice_eval.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 1, "", "failed"),
+        ) as run:
+            with self.assertRaises(RuntimeError):
+                codex_juice_eval.ask("gpt-test", "medium")
+
+        child_environment = run.call_args.kwargs["env"]
+        self.assertEqual(child_environment["CODEX_PARENT_ENV"], "inherited")
+        self.assertEqual(
+            child_environment["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"], "codex-tui"
+        )
 
     def test_selector_uses_one_context_for_all_efforts(self):
         runtime = SimpleNamespace(
