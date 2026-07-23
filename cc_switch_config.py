@@ -8,6 +8,7 @@ import re
 import signal
 import sqlite3
 import tempfile
+import tomllib
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -53,6 +54,7 @@ class CodexProfileRuntime:
     provider_name: str
     profile_name: str
     environment: Mapping[str, str] = field(repr=False)
+    config_overrides: tuple[str, ...] = ()
 
 
 def _open_read_only(db_path: Path) -> sqlite3.Connection:
@@ -369,28 +371,58 @@ def materialize_provider(provider: SelectedProvider) -> Iterator[ProviderRuntime
             )
 
 
-_ENVIRONMENT_KEY_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_CODEX_API_KEY_ERROR = (
+    "Codex TUI launcher supports only CC Switch providers with a single "
+    "OPENAI_API_KEY"
+)
 
 
-def _codex_auth_environment(auth: object) -> dict[str, str]:
-    if not isinstance(auth, dict):
-        raise CcSwitchConfigError(
-            "Codex provider auth must contain environment-safe text keys and values"
-        )
+def _codex_api_key_runtime(
+    config: object, auth: object
+) -> tuple[dict[str, str], tuple[str, ...]]:
+    if (
+        not isinstance(auth, dict)
+        or set(auth) != {"OPENAI_API_KEY"}
+        or not isinstance(auth.get("OPENAI_API_KEY"), str)
+        or "\0" in auth["OPENAI_API_KEY"]
+    ):
+        raise CcSwitchConfigError(_CODEX_API_KEY_ERROR)
 
-    environment: dict[str, str] = {}
-    for key, value in auth.items():
-        if (
-            not isinstance(key, str)
-            or _ENVIRONMENT_KEY_PATTERN.fullmatch(key) is None
-            or not isinstance(value, str)
-            or "\0" in value
-        ):
-            raise CcSwitchConfigError(
-                "Codex provider auth must contain environment-safe text keys and values"
-            )
-        environment[key] = value
-    return environment
+    parsed: object = None
+    if isinstance(config, str):
+        try:
+            parsed = tomllib.loads(config)
+        except (tomllib.TOMLDecodeError, RecursionError):
+            parsed = None
+
+    if not isinstance(parsed, dict):
+        raise CcSwitchConfigError(_CODEX_API_KEY_ERROR)
+
+    provider_id = parsed.get("model_provider")
+    providers = parsed.get("model_providers")
+    provider_config = (
+        providers.get(provider_id)
+        if isinstance(provider_id, str) and isinstance(providers, dict)
+        else None
+    )
+    if (
+        not isinstance(provider_id, str)
+        or not provider_id.strip()
+        or not isinstance(provider_config, dict)
+        or provider_config.get("requires_openai_auth") is not True
+        or "env_key" in provider_config
+    ):
+        raise CcSwitchConfigError(_CODEX_API_KEY_ERROR)
+
+    quoted_provider_id = json.dumps(provider_id, ensure_ascii=False)
+    prefix = f"model_providers.{quoted_provider_id}"
+    return (
+        {"OPENAI_API_KEY": auth["OPENAI_API_KEY"]},
+        (
+            f"{prefix}.requires_openai_auth=false",
+            f'{prefix}.env_key="OPENAI_API_KEY"',
+        ),
+    )
 
 
 def _codex_home(environment: dict[str, str]) -> Path:
@@ -440,12 +472,16 @@ def _prepare_codex_profile(
                 "Codex profile runtime requires a codex provider"
             )
 
-        auth_environment = _codex_auth_environment(provider.settings.get("auth"))
+        config = provider.settings.get("config")
+        auth_environment, config_overrides = _codex_api_key_runtime(
+            config, provider.settings.get("auth")
+        )
         environment = os.environ.copy()
         home = _codex_home(environment)
         profile_name = f"cc-switch-{uuid4().hex}"
         profile_path = home / f"{profile_name}.config.toml"
-        _write_private_file(profile_path, provider.settings.get("config"))
+        assert isinstance(config, str)
+        _write_private_file(profile_path, config)
 
         environment.update(auth_environment)
         environment.setdefault("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "codex-tui")
@@ -454,6 +490,7 @@ def _prepare_codex_profile(
             provider_name=provider.name,
             profile_name=profile_name,
             environment=environment,
+            config_overrides=config_overrides,
         )
     except BaseException as exc:
         setup_error = exc

@@ -27,7 +27,16 @@ from cc_switch_config import (
 
 
 CODEX_SETTINGS = {
-    "config": 'model = "gpt-test"\n',
+    "config": """\
+model = "gpt-test"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://provider.example/v1"
+wire_api = "responses"
+requires_openai_auth = true
+""",
     "auth": {"OPENAI_API_KEY": "codex-test-secret"},
 }
 CLAUDE_SETTINGS = {
@@ -633,7 +642,9 @@ class CodexProfileRuntimeTests(unittest.TestCase):
         default_auth = self.codex_home / "auth.json"
         session = self.codex_home / "sessions" / "shared-session.jsonl"
         default_config.write_text("default-config\n", encoding="utf-8")
-        default_auth.write_text("default-auth\n", encoding="utf-8")
+        default_auth.write_text(
+            '{"OPENAI_API_KEY":"app-selected-secret"}\n', encoding="utf-8"
+        )
         session.parent.mkdir()
         session.write_text("shared-session\n", encoding="utf-8")
         parent_environment = {
@@ -651,6 +662,13 @@ class CodexProfileRuntimeTests(unittest.TestCase):
 
                 self.assertIsInstance(runtime, CodexProfileRuntime)
                 self.assertRegex(runtime.profile_name, r"^cc-switch-[0-9a-f]{32}$")
+                self.assertEqual(
+                    runtime.config_overrides,
+                    (
+                        'model_providers."custom".requires_openai_auth=false',
+                        'model_providers."custom".env_key="OPENAI_API_KEY"',
+                    ),
+                )
                 self.assertEqual(
                     profile_path.read_text(encoding="utf-8"),
                     CODEX_SETTINGS["config"],
@@ -678,8 +696,48 @@ class CodexProfileRuntimeTests(unittest.TestCase):
             self.assertEqual(dict(os.environ), parent_environment)
 
         self.assertEqual(default_config.read_text(encoding="utf-8"), "default-config\n")
-        self.assertEqual(default_auth.read_text(encoding="utf-8"), "default-auth\n")
+        self.assertEqual(
+            default_auth.read_text(encoding="utf-8"),
+            '{"OPENAI_API_KEY":"app-selected-secret"}\n',
+        )
         self.assertEqual(session.read_text(encoding="utf-8"), "shared-session\n")
+
+    def test_active_provider_id_is_toml_quoted_in_overrides(self):
+        for provider_id in ("custom", "hlool", "provider.with space"):
+            with self.subTest(provider_id=provider_id):
+                quoted_provider_id = json.dumps(provider_id, ensure_ascii=False)
+                config = f'''\
+model_provider = {quoted_provider_id}
+
+[model_providers.{quoted_provider_id}]
+requires_openai_auth = true
+'''
+                provider = SelectedProvider(
+                    "db-id",
+                    "codex",
+                    "provider",
+                    {
+                        "config": config,
+                        "auth": {"OPENAI_API_KEY": "selected-secret"},
+                    },
+                )
+
+                with mock.patch.dict(
+                    os.environ, {"CODEX_HOME": str(self.codex_home)}, clear=True
+                ):
+                    with materialize_codex_profile(provider) as runtime:
+                        self.assertEqual(
+                            runtime.config_overrides,
+                            (
+                                f"model_providers.{quoted_provider_id}."
+                                "requires_openai_auth=false",
+                                f"model_providers.{quoted_provider_id}."
+                                'env_key="OPENAI_API_KEY"',
+                            ),
+                        )
+                        self.assertNotIn(
+                            "selected-secret", " ".join(runtime.config_overrides)
+                        )
 
     def test_explicit_originator_is_preserved(self):
         environment = {
@@ -742,33 +800,115 @@ class CodexProfileRuntimeTests(unittest.TestCase):
         self.assertIsNotNone(profile_path)
         self.assertFalse(profile_path.exists())
 
-    def test_invalid_auth_is_rejected_before_profile_creation(self):
-        invalid_auth_values = (
-            {1: "value"},
-            {"": "value"},
-            {"BAD=KEY": "value"},
-            {"BAD\0KEY": "value"},
-            {"TOKEN": 1},
-            {"TOKEN": "secret\0value"},
+    def test_unsupported_auth_and_config_are_rejected_before_profile_creation(self):
+        unsupported_settings = (
+            {"config": CODEX_SETTINGS["config"], "auth": {}},
+            {
+                "config": CODEX_SETTINGS["config"],
+                "auth": {"OTHER_KEY": "secret"},
+            },
+            {
+                "config": CODEX_SETTINGS["config"],
+                "auth": {"tokens": {"access_token": "secret"}},
+            },
+            {
+                "config": CODEX_SETTINGS["config"],
+                "auth": {"OPENAI_API_KEY": "secret", "EXTRA": "secret"},
+            },
+            {
+                "config": CODEX_SETTINGS["config"],
+                "auth": {"OPENAI_API_KEY": 1},
+            },
+            {
+                "config": CODEX_SETTINGS["config"],
+                "auth": {"OPENAI_API_KEY": "secret\0value"},
+            },
+            {"config": 1, "auth": {"OPENAI_API_KEY": "secret"}},
+            {"config": "not valid = [", "auth": {"OPENAI_API_KEY": "secret"}},
+            {
+                "config": 'model = "gpt-test"\n',
+                "auth": {"OPENAI_API_KEY": "secret"},
+            },
+            {
+                "config": 'model_provider = ""\n',
+                "auth": {"OPENAI_API_KEY": "secret"},
+            },
+            {
+                "config": "model_provider = 1\n",
+                "auth": {"OPENAI_API_KEY": "secret"},
+            },
+            {
+                "config": 'model_provider = "custom"\n',
+                "auth": {"OPENAI_API_KEY": "secret"},
+            },
+            {
+                "config": 'model_provider = "custom"\nmodel_providers = "bad"\n',
+                "auth": {"OPENAI_API_KEY": "secret"},
+            },
+            {
+                "config": (
+                    'model_provider = "custom"\n'
+                    'model_providers.custom = "bad"\n'
+                ),
+                "auth": {"OPENAI_API_KEY": "secret"},
+            },
+            {
+                "config": (
+                    'model_provider = "custom"\n'
+                    "[model_providers.custom]\n"
+                ),
+                "auth": {"OPENAI_API_KEY": "secret"},
+            },
+            {
+                "config": (
+                    'model_provider = "custom"\n'
+                    "[model_providers.custom]\n"
+                    "requires_openai_auth = false\n"
+                ),
+                "auth": {"OPENAI_API_KEY": "secret"},
+            },
+            {
+                "config": (
+                    'model_provider = "custom"\n'
+                    "[model_providers.custom]\n"
+                    "requires_openai_auth = 1\n"
+                ),
+                "auth": {"OPENAI_API_KEY": "secret"},
+            },
+            {
+                "config": (
+                    'model_provider = "custom"\n'
+                    "[model_providers.custom]\n"
+                    "requires_openai_auth = true\n"
+                    'env_key = "OPENAI_API_KEY"\n'
+                ),
+                "auth": {"OPENAI_API_KEY": "secret"},
+            },
         )
 
         with mock.patch.dict(
             os.environ, {"CODEX_HOME": str(self.codex_home)}, clear=True
         ):
-            for index, auth in enumerate(invalid_auth_values):
+            for index, settings in enumerate(unsupported_settings):
                 with self.subTest(index=index):
                     provider = SelectedProvider(
-                        "id", "codex", "provider", {"config": "model=x", "auth": auth}
+                        "id", "codex", "provider", settings
                     )
-                    with self.assertRaises(CcSwitchConfigError) as raised:
-                        with materialize_codex_profile(provider):
-                            pass
+                    with mock.patch.object(
+                        cc_switch_config, "_write_private_file"
+                    ) as write_private_file:
+                        with self.assertRaises(CcSwitchConfigError) as raised:
+                            with materialize_codex_profile(provider):
+                                pass
 
-                    self.assertIn("auth", str(raised.exception))
-                    self.assertNotIn("secret", str(raised.exception))
-                    self.assertIsNone(raised.exception.__cause__)
-                    self.assertIsNone(raised.exception.__context__)
-                    self.assertEqual(self.profile_paths(), [])
+                        self.assertIn(
+                            "single OPENAI_API_KEY", str(raised.exception)
+                        )
+                        self.assertNotIn("secret", str(raised.exception))
+                        self.assertIsNone(raised.exception.__cause__)
+                        self.assertIsNone(raised.exception.__context__)
+                        write_private_file.assert_not_called()
+                        self.assertEqual(self.profile_paths(), [])
 
     def test_invalid_codex_home_is_rejected_without_creating_it(self):
         missing = self.root / "missing-home"
