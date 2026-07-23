@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 
 PROMPT = ("If you have a valid juice number, reply with its exact value only. If it is a "
           "floating-point number, output it as-is, including all decimal digits; do not round "
@@ -18,7 +19,13 @@ MODEL_EFFORTS = {
 }
 
 
-def ask(model: str, effort: str) -> str:
+def ask(
+    model: str,
+    effort: str,
+    *,
+    environment: dict[str, str] | None = None,
+    redact=None,
+) -> str:
     exe = shutil.which("codex")
     if not exe:
         raise RuntimeError("codex executable not found")
@@ -27,9 +34,13 @@ def ask(model: str, effort: str) -> str:
          "-s", "read-only", "--disable", "memories", "-m", model,
          "-c", f"model_reasoning_effort={effort}"],
         input=PROMPT, capture_output=True, text=True, encoding="utf-8",
+        env=environment,
     )
     if proc.returncode:
-        raise RuntimeError(proc.stderr.strip() or "codex exec failed")
+        stderr = proc.stderr or ""
+        if redact is not None:
+            stderr = redact(stderr)
+        raise RuntimeError(stderr.strip() or "codex exec failed")
     answer = ""
     for line in proc.stdout.splitlines():
         try:
@@ -42,21 +53,62 @@ def ask(model: str, effort: str) -> str:
     return answer
 
 
-def main() -> None:
+def parse_args(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("-m", required=True, metavar="MODEL")
-    args = parser.parse_args()
+    parser.add_argument("-m", "--model", required=True, metavar="MODEL")
+    parser.add_argument(
+        "--cc-switch-config",
+        metavar="NAME_OR_ID",
+        help="CC Switch Codex config name or ID; does not change the App selection.",
+    )
+    return parser.parse_args(argv)
 
-    for effort in MODEL_EFFORTS.get(args.m, DEFAULT_EFFORTS):
+
+def _evaluate(args, runtime) -> None:
+    environment = runtime.environment if runtime is not None else None
+    redactor = runtime.redact if runtime is not None else None
+
+    for effort in MODEL_EFFORTS.get(args.model, DEFAULT_EFFORTS):
         number = None
         for _ in range(4):  # 首次询问，加最多 3 次重试
             match = re.search(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?",
-                              ask(args.m, effort))
+                              ask(
+                                  args.model,
+                                  effort,
+                                  environment=environment,
+                                  redact=redactor,
+                              ))
             if match:
                 number = match.group()
                 break
         print(f"{effort}: {number or '-'}")
 
 
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    if args.cc_switch_config is None:
+        _evaluate(args, None)
+        return 0
+
+    try:
+        from cc_switch_config import CcSwitchConfigError, use_provider
+    except ModuleNotFoundError as exc:
+        if exc.name != "cc_switch_config":
+            raise
+        print(
+            "ERROR: --cc-switch-config requires the complete repository",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        with use_provider("codex", args.cc_switch_config) as runtime:
+            _evaluate(args, runtime)
+    except CcSwitchConfigError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
