@@ -26,6 +26,40 @@ python claude_candy_eval.py --cc-switch-config anyrouter -m sonnet -r high -n 5
 脚本会自动限定配置类型：三个 Codex 脚本只查找 `app_type=codex`，Claude candy 只查找
 `app_type=claude`，所以两种配置使用同一个名称也不会混用。
 
+### 临时启动其他 Codex 配置
+
+如果 CC Switch App 当前选择了配置 A，可以在不切换 App、不影响配置 A 已有窗口的情况下，
+用另一个 Codex provider 启动交互式 TUI：
+
+```bash
+python3 codex_tui.py --cc-switch-config jianzhile
+```
+
+`--` 后面的参数会按原顺序传给 Codex。例如在当前目录打开会话恢复列表：
+
+```bash
+python3 codex_tui.py --cc-switch-config jianzhile -- resume
+```
+
+也可以在任意目录按 session ID 恢复，并为这次启动指定模型：
+
+```bash
+python3 /path/to/codex-candy-eval/codex_tui.py \
+  --cc-switch-config jianzhile -- \
+  resume SESSION_ID --model gpt-5.6-sol
+```
+
+启动器只查找 `app_type=codex` 的 provider。它不会创建按 provider 隔离的
+`CODEX_HOME`，而是继续使用当前 `CODEX_HOME`（未设置时为 `~/.codex`），因此所有
+provider 共享 sessions、SQLite 状态、历史、skills 和 plugins：配置 B 可以在相同目录
+通过 `resume` 找到配置 A 的会话，也可以在其他目录通过 session ID 恢复。
+
+每次启动只会在共享 `CODEX_HOME` 中创建一个权限为 `0600` 的随机临时 profile，provider
+认证只注入该 Codex 子进程。退出、异常或收到 SIGTERM 后会删除该 profile，不修改 CC Switch
+App 当前选择、父终端环境、默认 `config.toml` 或默认 `auth.json`。启动器自身需要占用
+`--profile`，所以不允许在转发参数中再次使用 `--profile` 或 `-p`；`--model` 和
+`-c/--config` 等其他 Codex 参数仍可正常传递。
+
 配置在进程启动时读取一次，并写入权限为 owner-only 的临时目录：Codex 使用临时
 `CODEX_HOME`，Claude Code 使用临时 `CLAUDE_CONFIG_DIR`。评测期间不会调用 `cc-switch`
 CLI，不会切换或写入 App 当前配置，也不会修改默认的 `~/.codex` 或 `~/.claude`；进程结束、
