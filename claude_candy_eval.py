@@ -46,7 +46,13 @@ def resolve_claude_executable() -> str:
     raise RuntimeError("找不到 claude 可执行文件，请确认已安装并加入 PATH。")
 
 
-def run_claude(model: str | None, effort: str | None):
+def run_claude(
+    model: str | None,
+    effort: str | None,
+    *,
+    environment: dict[str, str] | None = None,
+    redact=None,
+):
     exe = resolve_claude_executable()
 
     cmd = [
@@ -68,13 +74,24 @@ def run_claude(model: str | None, effort: str | None):
         text=True,
         encoding="utf-8",
         errors="replace",
+        env=environment,
     )
     if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "claude failed")
+        stderr = proc.stderr or ""
+        stdout = proc.stdout or ""
+        if redact is not None:
+            stderr = redact(stderr)
+            stdout = redact(stdout)
+        raise RuntimeError(stderr.strip() or stdout.strip() or "claude failed")
 
     data = json.loads(proc.stdout)
     if data.get("is_error"):
-        raise RuntimeError(data.get("result") or data.get("subtype") or "claude error")
+        result = str(data.get("result") or "")
+        subtype = str(data.get("subtype") or "")
+        if redact is not None:
+            result = redact(result)
+            subtype = redact(subtype)
+        raise RuntimeError(result or subtype or "claude error")
 
     usage = data.get("usage") or {}
     # 实际发送的完整提示 = 未命中缓存 + 写缓存 + 读缓存三部分之和。
@@ -199,8 +216,7 @@ def setup_console() -> bool:
     return True
 
 
-def main() -> None:
-    use_ansi = setup_console()
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-m", "--model", help="模型名或别名（如 fable/opus/sonnet）；缺省用 Claude Code 默认模型。")
     parser.add_argument(
@@ -209,7 +225,17 @@ def main() -> None:
         help="传给 claude --effort；缺省用 Claude Code 默认档位。",
     )
     parser.add_argument("-n", "--tests", type=int, default=1)
-    args = parser.parse_args()
+    parser.add_argument(
+        "--cc-switch-config",
+        metavar="NAME_OR_ID",
+        help="CC Switch Claude config name or ID; does not change the App selection.",
+    )
+    return parser.parse_args(argv)
+
+
+def _evaluate(args, use_ansi: bool, runtime) -> None:
+    environment = runtime.environment if runtime is not None else None
+    redactor = runtime.redact if runtime is not None else None
 
     headers = ["Run", "Claude", "In Tok", "Out Tok", "Time(s)", "TPS", "OK"]
     aligns = ["right", "left", "right", "right", "right", "right", "center"]
@@ -217,7 +243,12 @@ def main() -> None:
     def run_one(index: int) -> tuple[list, bool | None]:
         try:
             start = time.perf_counter()
-            text, in_tok, out_tok = run_claude(args.model, args.reasoning_effort)
+            text, in_tok, out_tok = run_claude(
+                args.model,
+                args.reasoning_effort,
+                environment=environment,
+                redact=redactor,
+            )
             elapsed = time.perf_counter() - start
             tps = out_tok / elapsed if out_tok and elapsed > 0 else None
             ok = bool(ANSWER_PATTERN.search(text))
@@ -254,5 +285,32 @@ def main() -> None:
           if graded else f"\nGraded 0/{args.tests}")
 
 
+def main(argv=None) -> int:
+    use_ansi = setup_console()
+    args = parse_args(argv)
+    if args.cc_switch_config is None:
+        _evaluate(args, use_ansi, None)
+        return 0
+
+    try:
+        from cc_switch_config import CcSwitchConfigError, use_provider
+    except ModuleNotFoundError as exc:
+        if exc.name != "cc_switch_config":
+            raise
+        print(
+            "ERROR: --cc-switch-config requires the complete repository",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        with use_provider("claude", args.cc_switch_config) as runtime:
+            _evaluate(args, use_ansi, runtime)
+    except CcSwitchConfigError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

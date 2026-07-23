@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import cc_switch_config
+import claude_candy_eval
 import codex_candy_eval
 
 
@@ -111,6 +112,130 @@ class CodexCandyTests(unittest.TestCase):
             codex_candy_eval, "run_codex"
         ) as run, redirect_stderr(io.StringIO()) as errors:
             result = codex_candy_eval.main(
+                ["--cc-switch-config", "missing", "-n", "1"]
+            )
+
+        self.assertEqual(result, 2)
+        self.assertIn("bad selector", errors.getvalue())
+        run.assert_not_called()
+
+
+class ClaudeCandyTests(unittest.TestCase):
+    def test_parser_accepts_selector(self):
+        args = claude_candy_eval.parse_args(
+            ["--cc-switch-config", "anyrouter", "-m", "sonnet", "-n", "2"]
+        )
+
+        self.assertEqual(
+            (args.cc_switch_config, args.model, args.tests),
+            ("anyrouter", "sonnet", 2),
+        )
+
+    def test_subprocess_receives_runtime_and_redacts_nonzero_error(self):
+        environment = {"CLAUDE_CONFIG_DIR": "/private/runtime"}
+        with mock.patch.object(
+            claude_candy_eval, "resolve_claude_executable", return_value="claude"
+        ), mock.patch.object(
+            claude_candy_eval.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 1, "", "secret-token"),
+        ) as run:
+            with self.assertRaisesRegex(RuntimeError, "<redacted>"):
+                claude_candy_eval.run_claude(
+                    None,
+                    None,
+                    environment=environment,
+                    redact=lambda text: text.replace("secret-token", "<redacted>"),
+                )
+
+        self.assertIs(run.call_args.kwargs["env"], environment)
+
+    def test_json_error_result_is_redacted(self):
+        response = '{"is_error":true,"result":"failed with secret-token"}'
+        with mock.patch.object(
+            claude_candy_eval, "resolve_claude_executable", return_value="claude"
+        ), mock.patch.object(
+            claude_candy_eval.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, response, ""),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "failed with <redacted>"):
+                claude_candy_eval.run_claude(
+                    None,
+                    None,
+                    redact=lambda text: text.replace("secret-token", "<redacted>"),
+                )
+
+    def test_json_error_subtype_fallback_is_redacted(self):
+        response = '{"is_error":true,"result":"","subtype":"secret-subtype"}'
+        with mock.patch.object(
+            claude_candy_eval, "resolve_claude_executable", return_value="claude"
+        ), mock.patch.object(
+            claude_candy_eval.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, response, ""),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "<redacted>-subtype"):
+                claude_candy_eval.run_claude(
+                    None,
+                    None,
+                    redact=lambda text: text.replace("secret", "<redacted>"),
+                )
+
+    def test_selector_enters_one_claude_context_for_all_runs(self):
+        runtime = SimpleNamespace(
+            environment={"CLAUDE_CONFIG_DIR": "/private/runtime"},
+            redact=lambda text: text.replace("secret", "<redacted>"),
+        )
+        context_calls = []
+        run_calls = []
+
+        @contextmanager
+        def fake_use_provider(app_type, selector, db_path=cc_switch_config.DEFAULT_DB_PATH):
+            context_calls.append((app_type, selector, db_path))
+            yield runtime
+
+        def fake_run_claude(model, effort, *, environment=None, redact=None):
+            run_calls.append((model, effort, environment, redact))
+            return ("answer 21", 1, 2)
+
+        with mock.patch.object(
+            cc_switch_config, "use_provider", side_effect=fake_use_provider
+        ), mock.patch.object(
+            claude_candy_eval, "run_claude", side_effect=fake_run_claude
+        ), mock.patch.object(claude_candy_eval, "setup_console", return_value=False), redirect_stdout(
+            io.StringIO()
+        ):
+            result = claude_candy_eval.main(
+                ["--cc-switch-config", "anyrouter", "-m", "sonnet", "-n", "2"]
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(context_calls, [("claude", "anyrouter", cc_switch_config.DEFAULT_DB_PATH)])
+        self.assertEqual(len(run_calls), 2)
+        self.assertTrue(all(call[2] is runtime.environment for call in run_calls))
+        self.assertTrue(all(call[3] is runtime.redact for call in run_calls))
+
+    def test_no_selector_does_not_load_cc_switch_provider(self):
+        with mock.patch.object(claude_candy_eval, "setup_console", return_value=False), mock.patch.object(
+            claude_candy_eval, "run_claude", return_value=("answer 21", 1, 2)
+        ), mock.patch.object(cc_switch_config, "load_provider") as load, redirect_stdout(
+            io.StringIO()
+        ):
+            result = claude_candy_eval.main(["-n", "1"])
+
+        self.assertEqual(result, 0)
+        load.assert_not_called()
+
+    def test_configuration_error_stops_before_first_request(self):
+        with mock.patch.object(
+            cc_switch_config,
+            "use_provider",
+            side_effect=cc_switch_config.CcSwitchConfigError("bad selector"),
+        ), mock.patch.object(claude_candy_eval, "setup_console", return_value=False), mock.patch.object(
+            claude_candy_eval, "run_claude"
+        ) as run, redirect_stderr(io.StringIO()) as errors:
+            result = claude_candy_eval.main(
                 ["--cc-switch-config", "missing", "-n", "1"]
             )
 
