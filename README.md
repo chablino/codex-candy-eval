@@ -54,6 +54,12 @@ python3 /path/to/codex-candy-eval/codex_tui.py \
 provider 共享 sessions、SQLite 状态、历史、skills 和 plugins：配置 B 可以在相同目录
 通过 `resume` 找到配置 A 的会话，也可以在其他目录通过 session ID 恢复。
 
+交互启动器目前只支持认证对象中仅含一个 `OPENAI_API_KEY` 的 CC Switch Codex
+中转站配置，不支持 `OpenAI Official` 等包含登录 tokens 的复杂认证配置；不支持的配置会在
+启动 Codex 前安全退出。启动器会通过不含 token 的 Codex 配置覆盖，让所选 provider 从
+该子进程的 `OPENAI_API_KEY` 读取认证，因此即使 App 当前选择其他 provider，也不会误用
+共享 `auth.json` 中的 token。
+
 每次启动只会在共享 `CODEX_HOME` 中创建一个权限为 `0600` 的随机临时 profile，provider
 认证只注入该 Codex 子进程。退出、异常或收到 SIGTERM 后会删除该 profile，不修改 CC Switch
 App 当前选择、父终端环境、默认 `config.toml` 或默认 `auth.json`。启动器自身需要占用
