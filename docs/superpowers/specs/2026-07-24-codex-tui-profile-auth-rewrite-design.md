@@ -2,7 +2,7 @@
 
 日期：2026-07-24
 
-状态：用户已确认方案，待书面复核
+状态：用户已复核，已实施
 
 本设计取代
 `docs/superpowers/specs/2026-07-24-cc-switch-codex-tui-api-key-auth-fix-design.md`
@@ -180,4 +180,3 @@ python3 ~/to7for/nice/codex-candy-eval/codex_tui.py \
 
 预期不再出现 `provider name must not be empty` 或 `401 Invalid token`，请求使用 `muyuan`
 URL 和 key；App 选择、已有窗口及共享 sessions 不变。
-

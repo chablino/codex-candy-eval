@@ -56,9 +56,9 @@ provider 共享 sessions、SQLite 状态、历史、skills 和 plugins：配置 
 
 交互启动器目前只支持认证对象中仅含一个 `OPENAI_API_KEY` 的 CC Switch Codex
 中转站配置，不支持 `OpenAI Official` 等包含登录 tokens 的复杂认证配置；不支持的配置会在
-启动 Codex 前安全退出。启动器会通过不含 token 的 Codex 配置覆盖，让所选 provider 从
-该子进程的 `OPENAI_API_KEY` 读取认证，因此即使 App 当前选择其他 provider，也不会误用
-共享 `auth.json` 中的 token。
+启动 Codex 前安全退出。启动器会在权限为 `0600` 的临时 profile 中让所选 provider 从
+该子进程的 `OPENAI_API_KEY` 读取认证；profile 只保存环境变量名称，不保存 token。因此
+即使 App 当前选择其他 provider，也不会误用共享 `auth.json` 中的 token。
 
 每次启动只会在共享 `CODEX_HOME` 中创建一个权限为 `0600` 的随机临时 profile，provider
 认证只注入该 Codex 子进程。退出、异常或收到 SIGTERM 后会删除该 profile，不修改 CC Switch

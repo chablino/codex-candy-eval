@@ -1,5 +1,9 @@
 # CC Switch Codex TUI API-key Authentication Fix Implementation Plan
 
+> **Superseded:** The provider CLI override mechanism in this document is replaced by
+> `docs/superpowers/specs/2026-07-24-codex-tui-profile-auth-rewrite-design.md` after
+> Codex 0.145.0 compatibility testing exposed provider-map layering behavior.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make `codex_tui.py --cc-switch-config PROVIDER` authenticate with the selected CC Switch API key even when the App currently selects a different provider.

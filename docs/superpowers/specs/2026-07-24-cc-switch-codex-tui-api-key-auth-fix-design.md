@@ -1,5 +1,9 @@
 # CC Switch Codex TUI API-key 认证修复设计
 
+> **Superseded:** The provider CLI override mechanism in this document is replaced by
+> `docs/superpowers/specs/2026-07-24-codex-tui-profile-auth-rewrite-design.md` after
+> Codex 0.145.0 compatibility testing exposed provider-map layering behavior.
+
 日期：2026-07-24
 
 状态：用户已确认设计，待实施计划
