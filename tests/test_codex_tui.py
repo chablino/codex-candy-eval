@@ -1,10 +1,11 @@
 import contextlib
 import io
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import codex_tui
-from cc_switch_config import CcSwitchConfigError, CodexProfileRuntime
+from cc_switch_config import CcSwitchConfigError
 
 
 class ParserTests(unittest.TestCase):
@@ -92,16 +93,12 @@ class ParserTests(unittest.TestCase):
 class MainTests(unittest.TestCase):
     def setUp(self):
         self.environment = {"OPENAI_API_KEY": "provider-secret"}
-        self.config_overrides = (
-            'model_providers."custom".requires_openai_auth=false',
-            'model_providers."custom".env_key="OPENAI_API_KEY"',
-        )
-        self.runtime = CodexProfileRuntime(
+        self.runtime = SimpleNamespace(
             provider_id="provider-id",
             provider_name="jianzhile",
             profile_name="cc-switch-random",
             environment=self.environment,
-            config_overrides=self.config_overrides,
+            config_overrides=("legacy-auth-override",),
         )
 
     def runtime_context(self):
@@ -116,6 +113,8 @@ class MainTests(unittest.TestCase):
         forwarded = [
             "resume",
             "session-id",
+            "-c",
+            "model_reasoning_effort=high",
             "--model",
             "gpt-5.6-sol",
         ]
@@ -139,10 +138,6 @@ class MainTests(unittest.TestCase):
                 "/usr/local/bin/codex",
                 "--profile",
                 "cc-switch-random",
-                "-c",
-                self.config_overrides[0],
-                "-c",
-                self.config_overrides[1],
                 *forwarded,
             ],
             env=self.environment,
@@ -172,15 +167,7 @@ class MainTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         run.assert_called_once_with(
-            [
-                "/bin/codex",
-                "--profile",
-                "cc-switch-random",
-                "-c",
-                self.config_overrides[0],
-                "-c",
-                self.config_overrides[1],
-            ],
+            ["/bin/codex", "--profile", "cc-switch-random"],
             env=self.environment,
         )
 

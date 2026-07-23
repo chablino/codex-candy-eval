@@ -10,6 +10,7 @@ import sqlite3
 import tempfile
 import tomllib
 from collections.abc import Iterator, Mapping, Sequence
+from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -54,7 +55,6 @@ class CodexProfileRuntime:
     provider_name: str
     profile_name: str
     environment: Mapping[str, str] = field(repr=False)
-    config_overrides: tuple[str, ...] = ()
 
 
 def _open_read_only(db_path: Path) -> sqlite3.Connection:
@@ -372,14 +372,28 @@ def materialize_provider(provider: SelectedProvider) -> Iterator[ProviderRuntime
 
 
 _CODEX_API_KEY_ERROR = (
-    "Codex TUI launcher supports only CC Switch providers with a single "
-    "OPENAI_API_KEY"
+    "Codex TUI launcher supports only adaptable CC Switch profiles with a "
+    "single OPENAI_API_KEY"
+)
+_CODEX_OPENAI_AUTH_ASSIGNMENT = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)"
+    r"requires_openai_auth[ \t]*=[ \t]*true"
+    r"(?P<comment>[ \t]*(?:#.*)?)$"
 )
 
 
-def _codex_api_key_runtime(
+def _parse_codex_toml(config: object) -> dict[str, Any] | None:
+    if not isinstance(config, str):
+        return None
+    try:
+        return tomllib.loads(config)
+    except (tomllib.TOMLDecodeError, RecursionError):
+        return None
+
+
+def _codex_api_key_profile(
     config: object, auth: object
-) -> tuple[dict[str, str], tuple[str, ...]]:
+) -> tuple[dict[str, str], str]:
     if (
         not isinstance(auth, dict)
         or set(auth) != {"OPENAI_API_KEY"}
@@ -388,14 +402,8 @@ def _codex_api_key_runtime(
     ):
         raise CcSwitchConfigError(_CODEX_API_KEY_ERROR)
 
-    parsed: object = None
-    if isinstance(config, str):
-        try:
-            parsed = tomllib.loads(config)
-        except (tomllib.TOMLDecodeError, RecursionError):
-            parsed = None
-
-    if not isinstance(parsed, dict):
+    parsed = _parse_codex_toml(config)
+    if parsed is None:
         raise CcSwitchConfigError(_CODEX_API_KEY_ERROR)
 
     provider_id = parsed.get("model_provider")
@@ -414,15 +422,27 @@ def _codex_api_key_runtime(
     ):
         raise CcSwitchConfigError(_CODEX_API_KEY_ERROR)
 
-    quoted_provider_id = json.dumps(provider_id, ensure_ascii=False)
-    prefix = f"model_providers.{quoted_provider_id}"
-    return (
-        {"OPENAI_API_KEY": auth["OPENAI_API_KEY"]},
-        (
-            f"{prefix}.requires_openai_auth=false",
-            f'{prefix}.env_key="OPENAI_API_KEY"',
-        ),
-    )
+    expected = deepcopy(parsed)
+    expected_provider = expected["model_providers"][provider_id]
+    expected_provider["requires_openai_auth"] = False
+    expected_provider["env_key"] = "OPENAI_API_KEY"
+
+    transformed: list[str] = []
+    assert isinstance(config, str)
+    for match in _CODEX_OPENAI_AUTH_ASSIGNMENT.finditer(config):
+        replacement = (
+            f'{match.group("indent")}requires_openai_auth = false'
+            f'{match.group("comment")}\n'
+            f'{match.group("indent")}env_key = "OPENAI_API_KEY"'
+        )
+        candidate = config[: match.start()] + replacement + config[match.end() :]
+        if _parse_codex_toml(candidate) == expected:
+            transformed.append(candidate)
+
+    if len(transformed) != 1:
+        raise CcSwitchConfigError(_CODEX_API_KEY_ERROR)
+
+    return {"OPENAI_API_KEY": auth["OPENAI_API_KEY"]}, transformed[0]
 
 
 def _codex_home(environment: dict[str, str]) -> Path:
@@ -472,16 +492,14 @@ def _prepare_codex_profile(
                 "Codex profile runtime requires a codex provider"
             )
 
-        config = provider.settings.get("config")
-        auth_environment, config_overrides = _codex_api_key_runtime(
-            config, provider.settings.get("auth")
+        auth_environment, profile_config = _codex_api_key_profile(
+            provider.settings.get("config"), provider.settings.get("auth")
         )
         environment = os.environ.copy()
         home = _codex_home(environment)
         profile_name = f"cc-switch-{uuid4().hex}"
         profile_path = home / f"{profile_name}.config.toml"
-        assert isinstance(config, str)
-        _write_private_file(profile_path, config)
+        _write_private_file(profile_path, profile_config)
 
         environment.update(auth_environment)
         environment.setdefault("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "codex-tui")
@@ -490,7 +508,6 @@ def _prepare_codex_profile(
             provider_name=provider.name,
             profile_name=profile_name,
             environment=environment,
-            config_overrides=config_overrides,
         )
     except BaseException as exc:
         setup_error = exc

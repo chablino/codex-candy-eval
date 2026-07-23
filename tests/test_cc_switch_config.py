@@ -4,7 +4,9 @@ import signal
 import sqlite3
 import stat
 import tempfile
+import tomllib
 import unittest
+from copy import deepcopy
 from contextlib import closing, contextmanager
 from pathlib import Path
 from unittest import mock
@@ -662,17 +664,16 @@ class CodexProfileRuntimeTests(unittest.TestCase):
 
                 self.assertIsInstance(runtime, CodexProfileRuntime)
                 self.assertRegex(runtime.profile_name, r"^cc-switch-[0-9a-f]{32}$")
-                self.assertEqual(
-                    runtime.config_overrides,
-                    (
-                        'model_providers."custom".requires_openai_auth=false',
-                        'model_providers."custom".env_key="OPENAI_API_KEY"',
-                    ),
-                )
-                self.assertEqual(
-                    profile_path.read_text(encoding="utf-8"),
-                    CODEX_SETTINGS["config"],
-                )
+                self.assertFalse(hasattr(runtime, "config_overrides"))
+                profile_text = profile_path.read_text(encoding="utf-8")
+                expected_profile = deepcopy(tomllib.loads(CODEX_SETTINGS["config"]))
+                expected_provider = expected_profile["model_providers"]["custom"]
+                expected_provider["requires_openai_auth"] = False
+                expected_provider["env_key"] = "OPENAI_API_KEY"
+
+                self.assertEqual(tomllib.loads(profile_text), expected_profile)
+                self.assertNotEqual(profile_text, CODEX_SETTINGS["config"])
+                self.assertNotIn("codex-test-secret", profile_text)
                 self.assertEqual(stat.S_IMODE(profile_path.stat().st_mode), 0o600)
                 self.assertEqual(
                     runtime.environment["CODEX_HOME"], str(self.codex_home)
@@ -702,42 +703,45 @@ class CodexProfileRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(session.read_text(encoding="utf-8"), "shared-session\n")
 
-    def test_active_provider_id_is_toml_quoted_in_overrides(self):
-        for provider_id in ("custom", "hlool", "provider.with space"):
-            with self.subTest(provider_id=provider_id):
-                quoted_provider_id = json.dumps(provider_id, ensure_ascii=False)
-                config = f'''\
+    def test_profile_rewrite_targets_only_the_active_provider(self):
+        provider_id = "provider.with space"
+        quoted_provider_id = json.dumps(provider_id, ensure_ascii=False)
+        config = f'''\
 model_provider = {quoted_provider_id}
 
-[model_providers.{quoted_provider_id}]
+[unrelated]
 requires_openai_auth = true
-'''
-                provider = SelectedProvider(
-                    "db-id",
-                    "codex",
-                    "provider",
-                    {
-                        "config": config,
-                        "auth": {"OPENAI_API_KEY": "selected-secret"},
-                    },
-                )
 
-                with mock.patch.dict(
-                    os.environ, {"CODEX_HOME": str(self.codex_home)}, clear=True
-                ):
-                    with materialize_codex_profile(provider) as runtime:
-                        self.assertEqual(
-                            runtime.config_overrides,
-                            (
-                                f"model_providers.{quoted_provider_id}."
-                                "requires_openai_auth=false",
-                                f"model_providers.{quoted_provider_id}."
-                                'env_key="OPENAI_API_KEY"',
-                            ),
-                        )
-                        self.assertNotIn(
-                            "selected-secret", " ".join(runtime.config_overrides)
-                        )
+[model_providers.{quoted_provider_id}]
+name = "Selected"
+base_url = "https://provider.example/v1"
+wire_api = "responses"
+requires_openai_auth = true # selected provider
+'''
+        provider = SelectedProvider(
+            "db-id",
+            "codex",
+            "provider",
+            {
+                "config": config,
+                "auth": {"OPENAI_API_KEY": "selected-secret"},
+            },
+        )
+
+        with mock.patch.dict(
+            os.environ, {"CODEX_HOME": str(self.codex_home)}, clear=True
+        ):
+            with materialize_codex_profile(provider) as runtime:
+                profile_path = self.codex_home / f"{runtime.profile_name}.config.toml"
+                profile_text = profile_path.read_text(encoding="utf-8")
+                parsed = tomllib.loads(profile_text)
+
+                self.assertIs(parsed["unrelated"]["requires_openai_auth"], True)
+                selected = parsed["model_providers"][provider_id]
+                self.assertIs(selected["requires_openai_auth"], False)
+                self.assertEqual(selected["env_key"], "OPENAI_API_KEY")
+                self.assertIn("# selected provider", profile_text)
+                self.assertNotIn("selected-secret", profile_text)
 
     def test_explicit_originator_is_preserved(self):
         environment = {
@@ -881,6 +885,15 @@ requires_openai_auth = true
                     "[model_providers.custom]\n"
                     "requires_openai_auth = true\n"
                     'env_key = "OPENAI_API_KEY"\n'
+                ),
+                "auth": {"OPENAI_API_KEY": "secret"},
+            },
+            {
+                "config": (
+                    'model_provider = "custom"\n'
+                    "model_providers.custom = { "
+                    'name = "custom", base_url = "https://provider.example/v1", '
+                    'wire_api = "responses", requires_openai_auth = true }\n'
                 ),
                 "auth": {"OPENAI_API_KEY": "secret"},
             },
