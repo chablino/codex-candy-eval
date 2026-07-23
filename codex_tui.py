@@ -57,11 +57,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         with use_codex_profile(arguments.cc_switch_config) as runtime:
+            override_arguments = [
+                argument
+                for override in runtime.config_overrides
+                for argument in ("-c", override)
+            ]
             process = subprocess.run(
                 [
                     executable,
                     "--profile",
                     runtime.profile_name,
+                    *override_arguments,
                     *arguments.codex_args,
                 ],
                 env=runtime.environment,

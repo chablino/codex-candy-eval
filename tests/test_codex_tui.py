@@ -92,11 +92,16 @@ class ParserTests(unittest.TestCase):
 class MainTests(unittest.TestCase):
     def setUp(self):
         self.environment = {"OPENAI_API_KEY": "provider-secret"}
+        self.config_overrides = (
+            'model_providers."custom".requires_openai_auth=false',
+            'model_providers."custom".env_key="OPENAI_API_KEY"',
+        )
         self.runtime = CodexProfileRuntime(
             provider_id="provider-id",
             provider_name="jianzhile",
             profile_name="cc-switch-random",
             environment=self.environment,
+            config_overrides=self.config_overrides,
         )
 
     def runtime_context(self):
@@ -134,9 +139,17 @@ class MainTests(unittest.TestCase):
                 "/usr/local/bin/codex",
                 "--profile",
                 "cc-switch-random",
+                "-c",
+                self.config_overrides[0],
+                "-c",
+                self.config_overrides[1],
                 *forwarded,
             ],
             env=self.environment,
+        )
+        self.assertNotIn("provider-secret", run.call_args.args[0])
+        self.assertEqual(
+            run.call_args.kwargs["env"]["OPENAI_API_KEY"], "provider-secret"
         )
         manager.__enter__.assert_called_once_with()
         manager.__exit__.assert_called_once()
@@ -159,7 +172,15 @@ class MainTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         run.assert_called_once_with(
-            ["/bin/codex", "--profile", "cc-switch-random"],
+            [
+                "/bin/codex",
+                "--profile",
+                "cc-switch-random",
+                "-c",
+                self.config_overrides[0],
+                "-c",
+                self.config_overrides[1],
+            ],
             env=self.environment,
         )
 
