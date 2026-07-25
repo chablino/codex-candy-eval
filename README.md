@@ -66,8 +66,44 @@ App 当前选择、父终端环境、默认 `config.toml` 或默认 `auth.json`�
 `--profile`，所以不允许在转发参数中再次使用 `--profile` 或 `-p`；`--model` 和
 `-c/--config` 等其他 Codex 参数仍可正常传递。
 
-配置在进程启动时读取一次，并写入权限为 owner-only 的临时目录：Codex 使用临时
-`CODEX_HOME`，Claude Code 使用临时 `CLAUDE_CONFIG_DIR`。评测期间不会调用 `cc-switch`
+### 临时启动其他 Claude Code 配置
+
+Claude Code 也可以在不切换 CC Switch App 当前配置的情况下，临时使用另一个 Claude
+provider 启动交互窗口：
+
+```bash
+python3 claude_tui.py --cc-switch-config anyrouter
+```
+
+继续当前目录最近的会话，或在任意目录按 session ID 恢复：
+
+```bash
+python3 claude_tui.py --cc-switch-config anyrouter -- --continue
+python3 /path/to/codex-candy-eval/claude_tui.py \
+  --cc-switch-config anyrouter -- --resume SESSION_ID
+```
+
+启动器只查找 `app_type=claude` 的 provider，并继续使用当前 `CLAUDE_CONFIG_DIR`（未设置时
+为 `~/.claude`），不会按 provider 隔离 sessions、history、projects、plugins 或 skills。
+因此配置 B 可以继续配置 A 创建的会话，CC Switch App 当前选择、已经运行的 Claude 窗口和
+共享 `settings.json` 都不会被修改。
+
+CC Switch 所选 provider 的顶层 `env` 仅注入 Claude 子进程；`model`、`effortLevel`、
+`enabledPlugins` 等其余完整配置会写入权限为 `0600` 的临时 settings 文件。启动命令固定
+使用 `--setting-sources project,local` 排除当前 user settings 中由 App 选择的 provider
+环境，同时仍加载项目和 local settings。临时目录权限为 `0700`，settings 文件不含顶层
+`env`，所以 token、地址和自定义 headers 不会进入临时文件或命令行；正常退出、异常、
+Ctrl-C 或 SIGTERM 后都会清理临时目录。
+
+交互启动器支持包含非空 `ANTHROPIC_BASE_URL`，且仅包含
+`ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_API_KEY` 二者之一的 CC Switch 中转站配置。
+`Claude Official` 等依赖 OAuth/keychain 的配置不在支持范围内。启动器自身需要占用
+`--settings` 和 `--setting-sources`，所以不允许在转发参数中再次指定它们；
+`--continue`、`--resume`、`--model`、`--effort` 和权限模式等其他 Claude 参数可正常传递。
+
+评测脚本通过 selector 运行时会在启动时读取一次配置，并写入权限为 owner-only 的临时
+目录：Codex 评测使用临时 `CODEX_HOME`，Claude candy 评测使用临时
+`CLAUDE_CONFIG_DIR`。评测期间不会调用 `cc-switch`
 CLI，不会切换或写入 App 当前配置，也不会修改默认的 `~/.codex` 或 `~/.claude`；进程结束、
 异常、Ctrl-C 或收到 SIGTERM 后会清理临时目录。
 
