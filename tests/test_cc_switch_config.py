@@ -1073,7 +1073,7 @@ class ClaudeProfileRuntimeTests(unittest.TestCase):
             deepcopy(CLAUDE_PROFILE_SETTINGS),
         )
 
-    def test_profile_splits_settings_and_preserves_shared_state(self):
+    def test_profile_writes_complete_settings_and_preserves_shared_state(self):
         shared_settings = self.claude_home / "settings.json"
         shared_settings.write_text('{"model":"app-selected"}\n', encoding="utf-8")
         shared_session = self.claude_home / "projects" / "shared-session.jsonl"
@@ -1095,18 +1095,19 @@ class ClaudeProfileRuntimeTests(unittest.TestCase):
                 self.assertTrue(runtime.settings_path.is_file())
                 settings_text = runtime.settings_path.read_text(encoding="utf-8")
                 settings = json.loads(settings_text)
+                self.assertEqual(settings, CLAUDE_PROFILE_SETTINGS)
                 self.assertEqual(
-                    settings,
-                    {
-                        "model": "sonnet",
-                        "effortLevel": "high",
-                        "enabledPlugins": {"example@marketplace": True},
-                    },
+                    settings["env"]["ANTHROPIC_AUTH_TOKEN"],
+                    "claude-profile-secret",
                 )
-                self.assertNotIn("env", settings)
-                self.assertNotIn("claude-profile-secret", settings_text)
-                self.assertNotIn("claude-provider.example", settings_text)
-                self.assertNotIn("profile-header", settings_text)
+                self.assertEqual(
+                    settings["env"]["ANTHROPIC_BASE_URL"],
+                    "https://claude-provider.example/v1",
+                )
+                self.assertEqual(
+                    settings["env"]["ANTHROPIC_CUSTOM_HEADERS"],
+                    "X-Test: profile-header",
+                )
                 self.assertEqual(
                     runtime.environment["CLAUDE_CONFIG_DIR"],
                     str(self.claude_home),
@@ -1378,24 +1379,25 @@ class ClaudeProfileRuntimeTests(unittest.TestCase):
                 self.assertIsNone(raised.exception.__context__)
                 temporary_directory.assert_not_called()
 
-    def test_empty_non_env_settings_are_written_as_json_object(self):
+    def test_env_only_settings_are_written_as_complete_json_object(self):
+        provider_settings = {
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://provider.example/v1",
+                "ANTHROPIC_API_KEY": "api-secret",
+            }
+        }
         provider = SelectedProvider(
             "claude-id",
             "claude",
             "provider",
-            {
-                "env": {
-                    "ANTHROPIC_BASE_URL": "https://provider.example/v1",
-                    "ANTHROPIC_API_KEY": "api-secret",
-                }
-            },
+            deepcopy(provider_settings),
         )
 
         with cc_switch_config.materialize_claude_profile(provider) as runtime:
             self.assertTrue(runtime.settings_path.is_file())
             self.assertEqual(
                 json.loads(runtime.settings_path.read_text(encoding="utf-8")),
-                {},
+                provider_settings,
             )
 
     def test_concurrent_profiles_are_unique_and_cleanup_independently(self):

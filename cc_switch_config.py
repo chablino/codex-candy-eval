@@ -574,7 +574,7 @@ def _claude_profile_parts(
         raise CcSwitchConfigError(_CLAUDE_PROFILE_ERROR)
 
     settings = deepcopy(provider.settings)
-    provider_environment = settings.pop("env", None)
+    provider_environment = settings.get("env")
     if not isinstance(provider_environment, dict):
         raise CcSwitchConfigError(_CLAUDE_PROFILE_ERROR)
 

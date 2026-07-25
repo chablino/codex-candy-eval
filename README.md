@@ -88,12 +88,12 @@ python3 /path/to/codex-candy-eval/claude_tui.py \
 因此配置 B 可以继续配置 A 创建的会话，CC Switch App 当前选择、已经运行的 Claude 窗口和
 共享 `settings.json` 都不会被修改。
 
-CC Switch 所选 provider 的顶层 `env` 仅注入 Claude 子进程；`model`、`effortLevel`、
-`enabledPlugins` 等其余完整配置会写入权限为 `0600` 的临时 settings 文件。启动命令固定
-使用 `--setting-sources project,local` 排除当前 user settings 中由 App 选择的 provider
-环境，同时仍加载项目和 local settings。临时目录权限为 `0700`，settings 文件不含顶层
-`env`，所以 token、地址和自定义 headers 不会进入临时文件或命令行；正常退出、异常、
-Ctrl-C 或 SIGTERM 后都会清理临时目录。
+CC Switch 所选 provider 的完整配置（包括顶层 `env`）会写入权限为 `0600` 的临时
+settings 文件，同时同一份 `env` 会注入 Claude 子进程。启动命令固定使用
+`--setting-sources project,local` 保留正常的项目和 local settings，并通过优先级更高的
+`--settings` 确保指定 provider 的地址、凭证、模型映射和自定义 headers 最终生效。临时目录
+权限为 `0700`，token、地址和 headers 不会进入命令行、日志或公开错误；临时 settings
+仅在 Claude 进程运行期间存在，正常退出、异常、Ctrl-C 或 SIGTERM 后都会清理。
 
 交互启动器支持包含非空 `ANTHROPIC_BASE_URL`，且仅包含
 `ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_API_KEY` 二者之一的 CC Switch 中转站配置。
