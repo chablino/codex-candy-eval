@@ -57,6 +57,14 @@ class CodexProfileRuntime:
     environment: Mapping[str, str] = field(repr=False)
 
 
+@dataclass(frozen=True)
+class ClaudeProfileRuntime:
+    provider_id: str
+    provider_name: str
+    settings_path: Path
+    environment: Mapping[str, str] = field(repr=False)
+
+
 def _open_read_only(db_path: Path) -> sqlite3.Connection:
     return sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
 
@@ -548,6 +556,123 @@ def materialize_codex_profile(
             )
 
 
+_CLAUDE_PROFILE_ERROR = (
+    "Claude TUI launcher supports only CC Switch proxy profiles with "
+    "ANTHROPIC_BASE_URL and exactly one API credential"
+)
+_CLAUDE_PARENT_AUTH_KEYS = (
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+)
+
+
+def _claude_profile_parts(
+    provider: SelectedProvider,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    if provider.app_type != "claude":
+        raise CcSwitchConfigError(_CLAUDE_PROFILE_ERROR)
+
+    settings = deepcopy(provider.settings)
+    provider_environment = settings.pop("env", None)
+    if not isinstance(provider_environment, dict):
+        raise CcSwitchConfigError(_CLAUDE_PROFILE_ERROR)
+
+    for key, value in provider_environment.items():
+        if (
+            not isinstance(key, str)
+            or not key
+            or "=" in key
+            or "\0" in key
+            or not isinstance(value, str)
+            or "\0" in value
+        ):
+            raise CcSwitchConfigError(_CLAUDE_PROFILE_ERROR)
+
+    base_url = provider_environment.get("ANTHROPIC_BASE_URL")
+    if not isinstance(base_url, str) or not base_url.strip():
+        raise CcSwitchConfigError(_CLAUDE_PROFILE_ERROR)
+
+    credential_names = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
+    present_credentials = [
+        name for name in credential_names if name in provider_environment
+    ]
+    if len(present_credentials) != 1:
+        raise CcSwitchConfigError(_CLAUDE_PROFILE_ERROR)
+    if not provider_environment[present_credentials[0]].strip():
+        raise CcSwitchConfigError(_CLAUDE_PROFILE_ERROR)
+    if "CLAUDE_CONFIG_DIR" in provider_environment:
+        raise CcSwitchConfigError(_CLAUDE_PROFILE_ERROR)
+
+    return settings, provider_environment
+
+
+def _prepare_claude_profile(
+    provider: SelectedProvider,
+) -> tuple[tempfile.TemporaryDirectory[str], ClaudeProfileRuntime]:
+    temporary_directory: tempfile.TemporaryDirectory[str] | None = None
+    runtime: ClaudeProfileRuntime | None = None
+    setup_error: BaseException | None = None
+
+    try:
+        profile_settings, provider_environment = _claude_profile_parts(provider)
+        environment = os.environ.copy()
+        for key in _CLAUDE_PARENT_AUTH_KEYS:
+            environment.pop(key, None)
+        environment.update(provider_environment)
+
+        temporary_directory = tempfile.TemporaryDirectory(
+            prefix="codex-candy-eval-claude-"
+        )
+        root = Path(temporary_directory.name)
+        root.chmod(0o700)
+        settings_path = root / "settings.json"
+        _write_private_file(settings_path, _json_document(profile_settings))
+        runtime = ClaudeProfileRuntime(
+            provider_id=provider.provider_id,
+            provider_name=provider.name,
+            settings_path=settings_path,
+            environment=environment,
+        )
+    except BaseException as exc:
+        setup_error = exc
+
+    if setup_error is not None:
+        if temporary_directory is not None:
+            _cleanup_temporary_directory(temporary_directory)
+        if isinstance(setup_error, (KeyboardInterrupt, SystemExit)):
+            raise setup_error
+        if isinstance(setup_error, CcSwitchConfigError):
+            raise setup_error
+        raise CcSwitchConfigError(
+            "failed to materialize selected Claude profile"
+        )
+
+    assert temporary_directory is not None
+    assert runtime is not None
+    return temporary_directory, runtime
+
+
+@contextmanager
+def materialize_claude_profile(
+    provider: SelectedProvider,
+) -> Iterator[ClaudeProfileRuntime]:
+    """Overlay one Claude provider without replacing shared Claude state."""
+    temporary_directory, runtime = _prepare_claude_profile(provider)
+    body_failed = False
+    try:
+        yield runtime
+    except BaseException:
+        body_failed = True
+        raise
+    finally:
+        cleanup_succeeded = _cleanup_temporary_directory(temporary_directory)
+        if not body_failed and not cleanup_succeeded:
+            raise CcSwitchConfigError(
+                "failed to clean up selected Claude profile"
+            )
+
+
 @contextmanager
 def _sigterm_as_system_exit() -> Iterator[None]:
     previous_handler = signal.getsignal(signal.SIGTERM)
@@ -602,6 +727,23 @@ def use_codex_profile(
     provider = load_provider("codex", selector, db_path)
     with _sigterm_as_system_exit():
         with materialize_codex_profile(provider) as runtime:
+            yield runtime
+
+
+@contextmanager
+def use_claude_profile(
+    selector: str,
+    db_path: str | Path = DEFAULT_DB_PATH,
+) -> Iterator[ClaudeProfileRuntime]:
+    """Select one Claude provider while preserving shared Claude state."""
+    if os.name == "nt":
+        raise CcSwitchConfigError(
+            "--cc-switch-config is currently supported only on macOS/Linux"
+        )
+
+    provider = load_provider("claude", selector, db_path)
+    with _sigterm_as_system_exit():
+        with materialize_claude_profile(provider) as runtime:
             yield runtime
 
 

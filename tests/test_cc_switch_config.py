@@ -14,6 +14,7 @@ from unittest import mock
 import cc_switch_config
 from cc_switch_config import (
     CcSwitchConfigError,
+    ClaudeProfileRuntime,
     CodexProfileRuntime,
     ProviderRuntime,
     SelectedProvider,
@@ -44,6 +45,17 @@ requires_openai_auth = true
 CLAUDE_SETTINGS = {
     "env": {"ANTHROPIC_AUTH_TOKEN": "claude-test-secret"},
     "model": "sonnet",
+}
+CLAUDE_PROFILE_SETTINGS = {
+    "env": {
+        "ANTHROPIC_BASE_URL": "https://claude-provider.example/v1",
+        "ANTHROPIC_AUTH_TOKEN": "claude-profile-secret",
+        "ANTHROPIC_MODEL": "mapped-sonnet",
+        "ANTHROPIC_CUSTOM_HEADERS": "X-Test: profile-header",
+    },
+    "model": "sonnet",
+    "effortLevel": "high",
+    "enabledPlugins": {"example@marketplace": True},
 }
 
 
@@ -1045,6 +1057,528 @@ requires_openai_auth = true # selected provider
                     pass
 
         load.assert_not_called()
+
+
+class ClaudeProfileRuntimeTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.claude_home = self.root / "claude-home"
+        self.claude_home.mkdir()
+        self.provider = SelectedProvider(
+            "claude-id",
+            "claude",
+            "anyrouter",
+            deepcopy(CLAUDE_PROFILE_SETTINGS),
+        )
+
+    def test_profile_splits_settings_and_preserves_shared_state(self):
+        shared_settings = self.claude_home / "settings.json"
+        shared_settings.write_text('{"model":"app-selected"}\n', encoding="utf-8")
+        shared_session = self.claude_home / "projects" / "shared-session.jsonl"
+        shared_session.parent.mkdir()
+        shared_session.write_text("shared\n", encoding="utf-8")
+        parent_environment = {
+            "CLAUDE_CONFIG_DIR": str(self.claude_home),
+            "ANTHROPIC_AUTH_TOKEN": "parent-auth-token",
+            "ANTHROPIC_API_KEY": "parent-api-key",
+            "CLAUDE_CODE_OAUTH_TOKEN": "parent-oauth-token",
+            "INHERITED_VALUE": "kept",
+        }
+
+        with mock.patch.dict(os.environ, parent_environment, clear=True):
+            with cc_switch_config.materialize_claude_profile(
+                self.provider
+            ) as runtime:
+                self.assertIsInstance(runtime, ClaudeProfileRuntime)
+                self.assertTrue(runtime.settings_path.is_file())
+                settings_text = runtime.settings_path.read_text(encoding="utf-8")
+                settings = json.loads(settings_text)
+                self.assertEqual(
+                    settings,
+                    {
+                        "model": "sonnet",
+                        "effortLevel": "high",
+                        "enabledPlugins": {"example@marketplace": True},
+                    },
+                )
+                self.assertNotIn("env", settings)
+                self.assertNotIn("claude-profile-secret", settings_text)
+                self.assertNotIn("claude-provider.example", settings_text)
+                self.assertNotIn("profile-header", settings_text)
+                self.assertEqual(
+                    runtime.environment["CLAUDE_CONFIG_DIR"],
+                    str(self.claude_home),
+                )
+                self.assertEqual(
+                    runtime.environment["ANTHROPIC_BASE_URL"],
+                    "https://claude-provider.example/v1",
+                )
+                self.assertEqual(
+                    runtime.environment["ANTHROPIC_AUTH_TOKEN"],
+                    "claude-profile-secret",
+                )
+                self.assertNotIn("ANTHROPIC_API_KEY", runtime.environment)
+                self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", runtime.environment)
+                self.assertEqual(
+                    runtime.environment["ANTHROPIC_MODEL"], "mapped-sonnet"
+                )
+                self.assertEqual(
+                    runtime.environment["ANTHROPIC_CUSTOM_HEADERS"],
+                    "X-Test: profile-header",
+                )
+                self.assertEqual(runtime.environment["INHERITED_VALUE"], "kept")
+                self.assertEqual(
+                    stat.S_IMODE(runtime.settings_path.stat().st_mode), 0o600
+                )
+                self.assertEqual(
+                    stat.S_IMODE(runtime.settings_path.parent.stat().st_mode),
+                    0o700,
+                )
+                self.assertNotIn("claude-profile-secret", repr(runtime))
+                settings_path = runtime.settings_path
+                self.assertEqual(dict(os.environ), parent_environment)
+                self.assertEqual(
+                    self.provider.settings, CLAUDE_PROFILE_SETTINGS
+                )
+
+            self.assertFalse(settings_path.parent.exists())
+            self.assertEqual(dict(os.environ), parent_environment)
+
+        self.assertEqual(
+            shared_settings.read_text(encoding="utf-8"),
+            '{"model":"app-selected"}\n',
+        )
+        self.assertEqual(shared_session.read_text(encoding="utf-8"), "shared\n")
+
+    def test_api_key_profile_removes_other_parent_credentials(self):
+        provider = SelectedProvider(
+            "claude-id",
+            "claude",
+            "provider",
+            {
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://provider.example/v1",
+                    "ANTHROPIC_API_KEY": "selected-api-key",
+                }
+            },
+        )
+        parent_environment = {
+            "ANTHROPIC_AUTH_TOKEN": "parent-auth-token",
+            "CLAUDE_CODE_OAUTH_TOKEN": "parent-oauth-token",
+        }
+
+        with mock.patch.dict(os.environ, parent_environment, clear=True):
+            with cc_switch_config.materialize_claude_profile(provider) as runtime:
+                self.assertIn("ANTHROPIC_API_KEY", runtime.environment)
+                self.assertEqual(
+                    runtime.environment["ANTHROPIC_API_KEY"], "selected-api-key"
+                )
+                self.assertNotIn("ANTHROPIC_AUTH_TOKEN", runtime.environment)
+                self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", runtime.environment)
+
+    def test_invalid_profiles_are_rejected_before_temporary_directory_creation(self):
+        validation_secret = "claude-validation-secret"
+        valid_environment = {
+            "ANTHROPIC_BASE_URL": "https://provider.example/v1",
+            "ANTHROPIC_AUTH_TOKEN": validation_secret,
+        }
+        cases = (
+            (
+                "wrong-app",
+                SelectedProvider(
+                    "id", "codex", "provider", {"env": valid_environment}
+                ),
+            ),
+            ("missing-env", SelectedProvider("id", "claude", "provider", {})),
+            (
+                "non-object-env",
+                SelectedProvider(
+                    "id", "claude", "provider", {"env": [validation_secret]}
+                ),
+            ),
+            (
+                "missing-url",
+                SelectedProvider(
+                    "id",
+                    "claude",
+                    "provider",
+                    {"env": {"ANTHROPIC_AUTH_TOKEN": validation_secret}},
+                ),
+            ),
+            (
+                "blank-url",
+                SelectedProvider(
+                    "id",
+                    "claude",
+                    "provider",
+                    {"env": {**valid_environment, "ANTHROPIC_BASE_URL": "   "}},
+                ),
+            ),
+            (
+                "non-text-url",
+                SelectedProvider(
+                    "id",
+                    "claude",
+                    "provider",
+                    {"env": {**valid_environment, "ANTHROPIC_BASE_URL": 7}},
+                ),
+            ),
+            (
+                "no-auth",
+                SelectedProvider(
+                    "id",
+                    "claude",
+                    "provider",
+                    {"env": {"ANTHROPIC_BASE_URL": "https://provider.example/v1"}},
+                ),
+            ),
+            (
+                "two-auth",
+                SelectedProvider(
+                    "id",
+                    "claude",
+                    "provider",
+                    {
+                        "env": {
+                            **valid_environment,
+                            "ANTHROPIC_API_KEY": "second-secret",
+                        }
+                    },
+                ),
+            ),
+            (
+                "two-auth-one-empty",
+                SelectedProvider(
+                    "id",
+                    "claude",
+                    "provider",
+                    {
+                        "env": {
+                            **valid_environment,
+                            "ANTHROPIC_API_KEY": "",
+                        }
+                    },
+                ),
+            ),
+            (
+                "blank-auth",
+                SelectedProvider(
+                    "id",
+                    "claude",
+                    "provider",
+                    {
+                        "env": {
+                            **valid_environment,
+                            "ANTHROPIC_AUTH_TOKEN": "  ",
+                        }
+                    },
+                ),
+            ),
+            (
+                "non-text-auth",
+                SelectedProvider(
+                    "id",
+                    "claude",
+                    "provider",
+                    {
+                        "env": {
+                            **valid_environment,
+                            "ANTHROPIC_AUTH_TOKEN": 7,
+                        }
+                    },
+                ),
+            ),
+            (
+                "config-dir",
+                SelectedProvider(
+                    "id",
+                    "claude",
+                    "provider",
+                    {
+                        "env": {
+                            **valid_environment,
+                            "CLAUDE_CONFIG_DIR": "/private/other",
+                        }
+                    },
+                ),
+            ),
+            (
+                "empty-key",
+                SelectedProvider(
+                    "id",
+                    "claude",
+                    "provider",
+                    {"env": {**valid_environment, "": "value"}},
+                ),
+            ),
+            (
+                "equals-key",
+                SelectedProvider(
+                    "id",
+                    "claude",
+                    "provider",
+                    {"env": {**valid_environment, "BAD=KEY": "value"}},
+                ),
+            ),
+            (
+                "nul-key",
+                SelectedProvider(
+                    "id",
+                    "claude",
+                    "provider",
+                    {"env": {**valid_environment, "BAD\0KEY": "value"}},
+                ),
+            ),
+            (
+                "non-text-key",
+                SelectedProvider(
+                    "id",
+                    "claude",
+                    "provider",
+                    {"env": {**valid_environment, 7: "value"}},
+                ),
+            ),
+            (
+                "nul-value",
+                SelectedProvider(
+                    "id",
+                    "claude",
+                    "provider",
+                    {"env": {**valid_environment, "HEADER": "bad\0value"}},
+                ),
+            ),
+            (
+                "non-text-value",
+                SelectedProvider(
+                    "id",
+                    "claude",
+                    "provider",
+                    {"env": {**valid_environment, "HEADER": 7}},
+                ),
+            ),
+        )
+        expected_error = (
+            "Claude TUI launcher supports only CC Switch proxy profiles with "
+            "ANTHROPIC_BASE_URL and exactly one API credential"
+        )
+
+        for label, provider in cases:
+            with self.subTest(label=label), mock.patch.object(
+                cc_switch_config.tempfile, "TemporaryDirectory"
+            ) as temporary_directory:
+                with self.assertRaises(CcSwitchConfigError) as raised:
+                    with cc_switch_config.materialize_claude_profile(provider):
+                        pass
+
+                self.assertEqual(str(raised.exception), expected_error)
+                self.assertNotIn(validation_secret, str(raised.exception))
+                self.assertIsNone(raised.exception.__cause__)
+                self.assertIsNone(raised.exception.__context__)
+                temporary_directory.assert_not_called()
+
+    def test_empty_non_env_settings_are_written_as_json_object(self):
+        provider = SelectedProvider(
+            "claude-id",
+            "claude",
+            "provider",
+            {
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://provider.example/v1",
+                    "ANTHROPIC_API_KEY": "api-secret",
+                }
+            },
+        )
+
+        with cc_switch_config.materialize_claude_profile(provider) as runtime:
+            self.assertTrue(runtime.settings_path.is_file())
+            self.assertEqual(
+                json.loads(runtime.settings_path.read_text(encoding="utf-8")),
+                {},
+            )
+
+    def test_concurrent_profiles_are_unique_and_cleanup_independently(self):
+        second_provider = SelectedProvider(
+            "second",
+            "claude",
+            "second",
+            deepcopy(CLAUDE_PROFILE_SETTINGS),
+        )
+
+        with cc_switch_config.materialize_claude_profile(self.provider) as first:
+            first_path = first.settings_path
+            with cc_switch_config.materialize_claude_profile(
+                second_provider
+            ) as second:
+                second_path = second.settings_path
+                self.assertNotEqual(first_path, second_path)
+            self.assertFalse(second_path.parent.exists())
+            self.assertTrue(first_path.exists())
+        self.assertFalse(first_path.parent.exists())
+
+    def test_profile_is_cleaned_when_body_raises(self):
+        settings_path = None
+
+        with self.assertRaisesRegex(RuntimeError, "body failure"):
+            with cc_switch_config.materialize_claude_profile(
+                self.provider
+            ) as runtime:
+                settings_path = runtime.settings_path
+                raise RuntimeError("body failure")
+
+        self.assertIsNotNone(settings_path)
+        self.assertFalse(settings_path.parent.exists())
+
+    def test_partial_directory_is_removed_after_sanitized_setup_failure(self):
+        created_root = None
+
+        def fail_after_write(path, content):
+            nonlocal created_root
+            created_root = path.parent
+            path.write_text(content, encoding="utf-8")
+            raise OSError("claude-setup-secret")
+
+        with mock.patch.object(
+            cc_switch_config,
+            "_write_private_file",
+            side_effect=fail_after_write,
+        ):
+            with self.assertRaises(CcSwitchConfigError) as raised:
+                with cc_switch_config.materialize_claude_profile(self.provider):
+                    pass
+
+        self.assertIsNotNone(created_root)
+        self.assertFalse(created_root.exists())
+        self.assertNotIn("claude-setup-secret", str(raised.exception))
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+
+    def test_cleanup_only_failure_is_sanitized_without_exception_chain(self):
+        real_cleanup = cc_switch_config.tempfile.TemporaryDirectory.cleanup
+
+        def fail_after_cleanup(directory):
+            real_cleanup(directory)
+            raise OSError("claude-cleanup-secret")
+
+        with mock.patch.object(
+            cc_switch_config.tempfile.TemporaryDirectory,
+            "cleanup",
+            autospec=True,
+            side_effect=fail_after_cleanup,
+        ):
+            with self.assertRaises(CcSwitchConfigError) as raised:
+                with cc_switch_config.materialize_claude_profile(self.provider):
+                    pass
+
+        self.assertNotIn("claude-cleanup-secret", str(raised.exception))
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+
+    def test_body_exception_wins_when_claude_cleanup_also_fails(self):
+        body_error = KeyboardInterrupt("body interrupt")
+        real_cleanup = cc_switch_config.tempfile.TemporaryDirectory.cleanup
+
+        def fail_after_cleanup(directory):
+            real_cleanup(directory)
+            raise OSError("cleanup failure")
+
+        with mock.patch.object(
+            cc_switch_config.tempfile.TemporaryDirectory,
+            "cleanup",
+            autospec=True,
+            side_effect=fail_after_cleanup,
+        ) as cleanup:
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                with cc_switch_config.materialize_claude_profile(self.provider):
+                    raise body_error
+
+        self.assertIs(raised.exception, body_error)
+        cleanup.assert_called_once()
+
+    def test_use_claude_profile_installs_sigterm_before_materialization(self):
+        previous = object()
+        current_handler = {"value": previous}
+        materialized_providers = []
+
+        def fake_signal(_signum, handler):
+            current_handler["value"] = handler
+
+        @contextmanager
+        def interrupt_during_materialization(provider):
+            materialized_providers.append(provider)
+            current_handler["value"](signal.SIGTERM, None)
+            yield  # pragma: no cover
+
+        database_path = self.root / "unused.db"
+        with mock.patch.object(
+            cc_switch_config, "load_provider", return_value=self.provider
+        ) as load, mock.patch.object(
+            cc_switch_config,
+            "materialize_claude_profile",
+            interrupt_during_materialization,
+        ), mock.patch.object(
+            cc_switch_config.signal, "getsignal", return_value=previous
+        ), mock.patch.object(
+            cc_switch_config.signal, "signal", side_effect=fake_signal
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                with cc_switch_config.use_claude_profile(
+                    "anyrouter", database_path
+                ):
+                    pass
+
+        self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+        self.assertIs(current_handler["value"], previous)
+        load.assert_called_once_with("claude", "anyrouter", database_path)
+        self.assertEqual(materialized_providers, [self.provider])
+
+    def test_use_claude_profile_sigterm_cleans_temporary_settings(self):
+        previous = signal.getsignal(signal.SIGTERM)
+        settings_path = None
+
+        with mock.patch.object(
+            cc_switch_config, "load_provider", return_value=self.provider
+        ) as load:
+            with self.assertRaises(SystemExit) as raised:
+                with cc_switch_config.use_claude_profile(
+                    "anyrouter", self.root / "cc-switch.db"
+                ) as runtime:
+                    settings_path = runtime.settings_path
+                    handler = signal.getsignal(signal.SIGTERM)
+                    self.assertTrue(callable(handler))
+                    handler(signal.SIGTERM, None)
+
+        self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+        self.assertIsNotNone(settings_path)
+        self.assertFalse(settings_path.parent.exists())
+        self.assertEqual(signal.getsignal(signal.SIGTERM), previous)
+        load.assert_called_once_with(
+            "claude", "anyrouter", self.root / "cc-switch.db"
+        )
+
+    def test_use_claude_profile_rejects_windows_before_database_access(self):
+        with mock.patch.object(cc_switch_config.os, "name", "nt"), mock.patch.object(
+            cc_switch_config, "load_provider"
+        ) as load:
+            with self.assertRaisesRegex(CcSwitchConfigError, "macOS/Linux"):
+                with cc_switch_config.use_claude_profile(
+                    "provider", Path("never.db")
+                ):
+                    pass
+
+        load.assert_not_called()
+
+
+class ClaudeProfileRuntimeApiTests(unittest.TestCase):
+    def test_runtime_type_is_public(self):
+        self.assertTrue(hasattr(cc_switch_config, "ClaudeProfileRuntime"))
+
+    def test_materializer_is_public(self):
+        self.assertTrue(hasattr(cc_switch_config, "materialize_claude_profile"))
+
+    def test_selector_context_is_public(self):
+        self.assertTrue(hasattr(cc_switch_config, "use_claude_profile"))
 
 
 
