@@ -49,22 +49,49 @@ python3 /path/to/codex-candy-eval/codex_tui.py \
   resume SESSION_ID --model gpt-5.6-sol
 ```
 
-启动器只查找 `app_type=codex` 的 provider。它不会创建按 provider 隔离的
-`CODEX_HOME`，而是继续使用当前 `CODEX_HOME`（未设置时为 `~/.codex`），因此所有
-provider 共享 sessions、SQLite 状态、历史、skills 和 plugins：配置 B 可以在相同目录
-通过 `resume` 找到配置 A 的会话，也可以在其他目录通过 session ID 恢复。
+启动器只查找 `app_type=codex` 的 provider，并从 CC Switch SQLite 数据库只读加载指定
+provider；它不会读取或改变 App 当前选中的 provider，也不会修改数据库。最终配置按以下顺序
+生成：provider 原始配置；仅当该 provider 在 CC Switch 中开启 `Apply Common Config` 时，
+再结构化合并 Codex Common Config；最后叠加该 provider 自己的插件开关。因此，未开启
+`Apply Common Config` 就完全不会并入 Common Config。
 
-交互启动器目前只支持认证对象中仅含一个 `OPENAI_API_KEY` 的 CC Switch Codex
-中转站配置，不支持 `OpenAI Official` 等包含登录 tokens 的复杂认证配置；不支持的配置会在
-启动 Codex 前安全退出。启动器会在权限为 `0600` 的临时 profile 中让所选 provider 从
-该子进程的 `OPENAI_API_KEY` 读取认证；profile 只保存环境变量名称，不保存 token。因此
-即使 App 当前选择其他 provider，也不会误用共享 `auth.json` 中的 token。
+每次启动都会创建独立的临时 `CODEX_HOME`，其中包含这次运行的完整 `config.toml`，不使用
+Codex profile。provider 的 token 只通过该子进程的 `OPENAI_API_KEY` 注入，临时配置只保存
+环境变量名称。共享 `CODEX_HOME`（未设置时为 `~/.codex`）中的默认 `config.toml`、
+`auth.json` 和 CC Switch 配置都不会被覆盖；正常退出、异常、Ctrl-C 或 SIGTERM 后，插件状态
+同步完成再删除临时目录。
 
-每次启动只会在共享 `CODEX_HOME` 中创建一个权限为 `0600` 的随机临时 profile，provider
-认证只注入该 Codex 子进程。退出、异常或收到 SIGTERM 后会删除该 profile，不修改 CC Switch
-App 当前选择、父终端环境、默认 `config.toml` 或默认 `auth.json`。启动器自身需要占用
-`--profile`，所以不允许在转发参数中再次使用 `--profile` 或 `-p`；`--model` 和
-`-c/--config` 等其他 Codex 参数仍可正常传递。
+不同 provider 仍共享 sessions、SQLite 状态、history、skills、rules、memories 和插件目录，
+所以可以跨 provider 使用 `resume`。每个并发窗口都有独立临时配置；插件开关在退出时按实际
+变化加锁合并，不会因为另一个较早启动的窗口退出而整份覆盖。
+
+插件的安装和删除是全局的，启用和关闭是按 provider 保存的：
+
+- 在某个 provider 的 `/plugins` 中安装插件，会把插件安装到共享插件目录，并只为当前
+  provider 启用；其他 provider 能看到这个已安装插件，但默认不会自动启用。
+- 在 `/plugins` 中关闭或重新开启插件，只更新当前 provider 的开关。开关保存在共享
+  `CODEX_HOME/.cc-switch-tui/provider-plugins/`，不写入 CC Switch 数据库。
+- 在 `/plugins` 中删除插件，会从共享插件目录全局删除，并清除所有 provider 对它保存的
+  开关。
+- provider 配置或已启用的 Common Config 可以声明插件的默认开关；当前 provider 后续在
+  `/plugins` 中做出的开关变化优先于这个默认值。
+
+当前 `superpowers` 的 canonical ID 是 `superpowers@openai-api-curated`。
+`superpowers@openai-curated` 是旧 marketplace ID，启动器会将旧配置声明归一化为 canonical
+ID，并忽略旧 ID 的缓存，避免同时加载两份。
+
+如果只想清除某个 provider 通过启动器保存的插件开关，让它重新采用 provider 配置与
+Common Config 的默认值，可以使用：
+
+```bash
+python3 codex_tui.py --cc-switch-config fengwind --reset-plugin-state
+```
+
+该选项不会卸载全局插件，也不会影响其他 provider。交互启动器目前只支持认证对象中仅含一个
+`OPENAI_API_KEY` 的 CC Switch Codex 中转站配置，不支持 `OpenAI Official` 等包含登录
+tokens 的复杂认证配置；不支持的配置会在启动 Codex 前安全退出。启动器提供完整临时配置，
+所以不允许在转发参数中再次使用 `--profile` 或 `-p`；`--model` 和 `-c/--config` 等其他
+Codex 参数仍可正常传递。
 
 ### 临时启动其他 Claude Code 配置
 
