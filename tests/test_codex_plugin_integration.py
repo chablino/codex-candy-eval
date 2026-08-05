@@ -33,9 +33,97 @@ class CodexPluginCliIntegrationTests(unittest.TestCase):
         self.database = self.root / "cc-switch.db"
         self.codex = shutil.which("codex")
 
+        self._create_curated_marketplace()
         self._create_marketplace()
         self._create_database()
 
+    def _create_curated_marketplace(self):
+        root = self.shared_home / ".tmp" / "plugins"
+        marketplace_manifest = root / ".agents" / "plugins" / "marketplace.json"
+        marketplace_manifest.parent.mkdir(parents=True)
+        marketplace_manifest.write_text(
+            json.dumps(
+                {
+                    "name": "openai-curated",
+                    "interface": {"displayName": "Codex official"},
+                    "plugins": [
+                        {
+                            "name": "superpowers",
+                            "source": {
+                                "source": "local",
+                                "path": "./plugins/superpowers",
+                            },
+                            "policy": {
+                                "installation": "AVAILABLE",
+                                "authentication": "ON_INSTALL",
+                            },
+                            "category": "Developer Tools",
+                        }
+                    ],
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        api_marketplace_manifest = (
+            root / ".agents" / "plugins" / "api_marketplace.json"
+        )
+        api_marketplace_manifest.write_text(
+            json.dumps(
+                {
+                    "name": "openai-api-curated",
+                    "interface": {"displayName": "Codex official"},
+                    "plugins": [
+                        {
+                            "name": "superpowers",
+                            "source": {
+                                "source": "local",
+                                "path": "./plugins/superpowers",
+                            },
+                            "policy": {
+                                "installation": "AVAILABLE",
+                                "authentication": "ON_INSTALL",
+                                "products": ["CODEX"],
+                            },
+                            "category": "Developer Tools",
+                        }
+                    ],
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        plugin_root = root / "plugins" / "superpowers"
+        plugin_manifest = plugin_root / ".codex-plugin" / "plugin.json"
+        plugin_manifest.parent.mkdir(parents=True)
+        plugin_manifest.write_text(
+            json.dumps(
+                {
+                    "name": "superpowers",
+                    "version": "1.0.0",
+                    "description": "Isolated API marketplace fixture",
+                    "skills": "./skills/",
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        skill = plugin_root / "skills" / "fixture" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text(
+            """\
+---
+name: fixture
+description: Isolated API marketplace fixture.
+---
+
+# Fixture
+""",
+            encoding="utf-8",
+        )
     def _create_marketplace(self):
         manifest = {
             "name": "test-marketplace",
@@ -186,6 +274,24 @@ source = {json.dumps(str(self.marketplace))}
                 f"Codex plugin command did not return JSON: {result.stdout!r}"
             )
 
+    def _marketplace_command(self, runtime):
+        result = subprocess.run(
+            [self.codex, "plugin", "marketplace", "list", "--json"],
+            cwd=self.root,
+            env=runtime.environment,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError:
+            self.fail(
+                "Codex marketplace command did not return JSON: "
+                f"{result.stdout!r}"
+            )
+
     @staticmethod
     def _serialized_json_contains(document, *values):
         serialized = json.dumps(document, sort_keys=True)
@@ -218,6 +324,16 @@ source = {json.dumps(str(self.marketplace))}
             with use_codex_runtime(
                 "integration-provider", db_path=self.database
             ) as runtime:
+                self.assertEqual(
+                    json.loads((runtime.home / "auth.json").read_text()),
+                    {"OPENAI_API_KEY": "integration-test-secret"},
+                )
+                marketplaces = self._marketplace_command(runtime)
+                names = {
+                    entry["name"] for entry in marketplaces["marketplaces"]
+                }
+                self.assertIn("openai-api-curated", names)
+                self.assertNotIn("openai-curated", names)
                 available = self._plugin_command(
                     runtime,
                     "list",
