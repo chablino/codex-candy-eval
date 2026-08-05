@@ -326,6 +326,7 @@ def _prepare_codex_runtime(
             _parse_toml(common_config) if common_config is not None else None
         )
         shared_document = _read_shared_config(shared_home)
+        default_plugins = _load_default_plugin_config()
         baseline_document = (
             deep_merge(provider_document, common_document)
             if common_document is not None
@@ -352,6 +353,7 @@ def _prepare_codex_runtime(
             launcher_marketplaces,
             inventory,
             provider_plugins,
+            default_plugins=default_plugins,
         )
         final_document, auth_environment, auth_document = _codex_auth_parts(
             composed.document, provider.settings.get("auth")

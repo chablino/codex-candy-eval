@@ -213,6 +213,11 @@ class CodexRuntimeMaterializationTests(unittest.TestCase):
         )
         return f"{plugin}@{marketplace}"
 
+    def install_default_plugins(self):
+        for plugin_id in EXPECTED_DEFAULT_PLUGINS:
+            plugin, marketplace = plugin_id.rsplit("@", 1)
+            self.install_plugin(plugin, marketplace)
+
     def sidecar_path(self, provider_id="provider-id"):
         digest = hashlib.sha256(provider_id.encode()).hexdigest()
         return (
@@ -341,6 +346,95 @@ enabled = true
 
         self.assertEqual(config["model"], "gpt-common")
         self.assertTrue(config["plugins"][plugin_id]["enabled"])
+
+    def test_all_installed_project_defaults_are_enabled(self):
+        self.install_default_plugins()
+
+        with mock.patch.dict(os.environ, self.environment(), clear=True):
+            with materialize_codex_runtime(self.provider, None) as runtime:
+                config = tomllib.loads(runtime.config_path.read_text())
+
+                self.assertEqual(
+                    {
+                        plugin_id
+                        for plugin_id, entry in config["plugins"].items()
+                        if entry["enabled"]
+                    },
+                    EXPECTED_DEFAULT_PLUGINS,
+                )
+                self.assertEqual(runtime.warnings, ())
+
+    def test_uninstalled_default_is_silent_and_reinstall_restores_it(self):
+        plugin_id = CANONICAL_SUPERPOWERS_ID
+        plugin, marketplace = plugin_id.rsplit("@", 1)
+        self.install_plugin(plugin, marketplace)
+        plugin_root = (
+            self.shared_home / "plugins" / "cache" / marketplace / plugin
+        )
+
+        with mock.patch.dict(os.environ, self.environment(), clear=True):
+            with materialize_codex_runtime(self.provider, None) as runtime:
+                config = tomllib.loads(runtime.config_path.read_text())
+                self.assertTrue(config["plugins"][plugin_id]["enabled"])
+
+            shutil.rmtree(plugin_root)
+            with materialize_codex_runtime(self.provider, None) as runtime:
+                config = tomllib.loads(runtime.config_path.read_text())
+                self.assertNotIn(plugin_id, config.get("plugins", {}))
+                self.assertEqual(runtime.warnings, ())
+
+            self.install_plugin(plugin, marketplace)
+            with materialize_codex_runtime(self.provider, None) as runtime:
+                config = tomllib.loads(runtime.config_path.read_text())
+                self.assertTrue(config["plugins"][plugin_id]["enabled"])
+
+    def test_runtime_plugin_precedence_ends_with_provider_sidecar(self):
+        plugin_id = CANONICAL_SUPERPOWERS_ID
+        plugin, marketplace = plugin_id.rsplit("@", 1)
+        self.install_plugin(plugin, marketplace)
+        document = tomllib.loads(PROVIDER_CONFIG)
+        document["plugins"] = {
+            plugin_id: {"enabled": False, "provider_option": "kept"}
+        }
+        provider = SelectedProvider(
+            self.provider.provider_id,
+            "codex",
+            self.provider.name,
+            {
+                "config": tomli_w.dumps(document),
+                "auth": {"OPENAI_API_KEY": "provider-secret"},
+            },
+        )
+        common = f'''\
+[plugins."{plugin_id}"]
+enabled = true
+common_option = "kept"
+'''
+        initial = RuntimeSnapshot(
+            plugins={plugin_id: True},
+            marketplaces={},
+            inventory=frozenset({plugin_id}),
+        )
+        final = RuntimeSnapshot(
+            plugins={plugin_id: False},
+            marketplaces={},
+            inventory=initial.inventory,
+        )
+        PluginStateStore(self.shared_home).apply_runtime_changes(
+            provider.provider_id,
+            {plugin_id: True},
+            initial,
+            final,
+        )
+
+        with mock.patch.dict(os.environ, self.environment(), clear=True):
+            with materialize_codex_runtime(provider, common) as runtime:
+                config = tomllib.loads(runtime.config_path.read_text())
+
+        entry = config["plugins"][plugin_id]
+        self.assertFalse(entry["enabled"])
+        self.assertEqual(entry["provider_option"], "kept")
+        self.assertEqual(entry["common_option"], "kept")
 
     def test_auth_transformation_targets_only_selected_model_provider(self):
         config = """\
@@ -808,6 +902,27 @@ class CodexRuntimeFinalizationTests(unittest.TestCase):
             with materialize_codex_runtime(self.provider, None) as runtime:
                 self.assertTrue(self.plugin_enabled(runtime, plugin_id))
                 self.set_plugin(runtime, plugin_id, False)
+
+        self.assertEqual(self.state.load_provider_plugins("provider-id"), {})
+
+    def test_default_plugin_false_override_is_sparse_and_removable(self):
+        plugin_id, _ = self.install_plugin(
+            "superpowers", "openai-api-curated"
+        )
+
+        with mock.patch.dict(os.environ, self.environment(), clear=True):
+            with materialize_codex_runtime(self.provider, None) as runtime:
+                self.assertTrue(self.plugin_enabled(runtime, plugin_id))
+                self.set_plugin(runtime, plugin_id, False)
+
+            self.assertEqual(
+                self.state.load_provider_plugins("provider-id"),
+                {plugin_id: False},
+            )
+
+            with materialize_codex_runtime(self.provider, None) as runtime:
+                self.assertFalse(self.plugin_enabled(runtime, plugin_id))
+                self.set_plugin(runtime, plugin_id, True)
 
         self.assertEqual(self.state.load_provider_plugins("provider-id"), {})
 
