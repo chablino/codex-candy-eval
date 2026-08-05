@@ -1,6 +1,8 @@
 import hashlib
 import json
 import os
+import shutil
+import signal
 import stat
 import tempfile
 import tomllib
@@ -13,7 +15,11 @@ import tomli_w
 
 import codex_runtime
 from cc_switch_config import CcSwitchConfigError, SelectedProvider
-from codex_plugin_state import CANONICAL_SUPERPOWERS_ID
+from codex_plugin_state import (
+    CANONICAL_SUPERPOWERS_ID,
+    PluginStateStore,
+    RuntimeSnapshot,
+)
 from codex_runtime import (
     DIRECTORY_SHARE_ALLOWLIST,
     FILE_SHARE_ALLOWLIST,
@@ -582,6 +588,351 @@ requires_openai_auth = true
                     raise body_error
 
         self.assertIs(raised.exception, body_error)
+
+
+class CodexRuntimeFinalizationTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.shared_home = self.root / "shared-codex"
+        self.shared_home.mkdir()
+        self.provider = SelectedProvider(
+            "provider-id",
+            "codex",
+            "fengwind",
+            deepcopy(PROVIDER_SETTINGS),
+        )
+        self.state = PluginStateStore(self.shared_home)
+
+    def environment(self):
+        return {"CODEX_HOME": str(self.shared_home)}
+
+    def install_plugin(
+        self,
+        plugin="demo",
+        marketplace="test",
+        version="1.0.0",
+    ):
+        plugin_root = (
+            self.shared_home
+            / "plugins"
+            / "cache"
+            / marketplace
+            / plugin
+        )
+        manifest = plugin_root / version / ".codex-plugin" / "plugin.json"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text(
+            json.dumps({"name": plugin, "version": version}),
+            encoding="utf-8",
+        )
+        return f"{plugin}@{marketplace}", plugin_root
+
+    @staticmethod
+    def set_plugin(runtime, plugin_id, enabled):
+        document = tomllib.loads(runtime.config_path.read_text())
+        document.setdefault("plugins", {}).setdefault(plugin_id, {})[
+            "enabled"
+        ] = enabled
+        runtime.config_path.write_text(tomli_w.dumps(document), encoding="utf-8")
+
+    @staticmethod
+    def plugin_enabled(runtime, plugin_id):
+        document = tomllib.loads(runtime.config_path.read_text())
+        return document["plugins"][plugin_id]["enabled"]
+
+    def seed_sidecar(self, provider_id, plugin_id):
+        disabled = RuntimeSnapshot(
+            plugins={plugin_id: False},
+            marketplaces={},
+            inventory=frozenset({plugin_id}),
+        )
+        enabled = RuntimeSnapshot(
+            plugins={plugin_id: True},
+            marketplaces={},
+            inventory=disabled.inventory,
+        )
+        self.state.apply_runtime_changes(
+            provider_id, {plugin_id: False}, disabled, enabled
+        )
+
+    def test_false_to_true_writes_only_selected_provider_sidecar(self):
+        plugin_id, _ = self.install_plugin()
+
+        with mock.patch.dict(os.environ, self.environment(), clear=True):
+            with materialize_codex_runtime(self.provider, None) as runtime:
+                self.assertFalse(self.plugin_enabled(runtime, plugin_id))
+                self.set_plugin(runtime, plugin_id, True)
+
+        self.assertEqual(
+            self.state.load_provider_plugins("provider-id"), {plugin_id: True}
+        )
+        self.assertEqual(self.state.load_provider_plugins("other-provider"), {})
+
+    def test_returning_to_provider_baseline_removes_sparse_override(self):
+        plugin_id, _ = self.install_plugin()
+
+        with mock.patch.dict(os.environ, self.environment(), clear=True):
+            with materialize_codex_runtime(self.provider, None) as runtime:
+                self.set_plugin(runtime, plugin_id, True)
+            with materialize_codex_runtime(self.provider, None) as runtime:
+                self.assertTrue(self.plugin_enabled(runtime, plugin_id))
+                self.set_plugin(runtime, plugin_id, False)
+
+        self.assertEqual(self.state.load_provider_plugins("provider-id"), {})
+
+    def test_installing_cache_and_enabling_records_current_provider(self):
+        plugin_id = "demo@test"
+
+        with mock.patch.dict(os.environ, self.environment(), clear=True):
+            with materialize_codex_runtime(self.provider, None) as runtime:
+                installed_id, plugin_root = self.install_plugin()
+                self.assertEqual(installed_id, plugin_id)
+                self.set_plugin(runtime, plugin_id, True)
+
+        self.assertTrue(plugin_root.is_dir())
+        self.assertEqual(
+            self.state.load_provider_plugins("provider-id"), {plugin_id: True}
+        )
+
+    def test_removing_cache_clears_plugin_from_all_provider_sidecars(self):
+        plugin_id, plugin_root = self.install_plugin()
+        self.seed_sidecar("provider-id", plugin_id)
+        self.seed_sidecar("other-provider", plugin_id)
+
+        with mock.patch.dict(os.environ, self.environment(), clear=True):
+            with materialize_codex_runtime(self.provider, None) as runtime:
+                self.assertTrue(self.plugin_enabled(runtime, plugin_id))
+                shutil.rmtree(plugin_root)
+
+        self.assertEqual(self.state.load_provider_plugins("provider-id"), {})
+        self.assertEqual(self.state.load_provider_plugins("other-provider"), {})
+
+    def test_unchanged_old_runtime_cannot_overwrite_newer_sidecar(self):
+        plugin_id, _ = self.install_plugin()
+
+        with mock.patch.dict(os.environ, self.environment(), clear=True):
+            with materialize_codex_runtime(self.provider, None) as old_runtime:
+                self.assertFalse(self.plugin_enabled(old_runtime, plugin_id))
+                self.seed_sidecar("provider-id", plugin_id)
+
+        self.assertEqual(
+            self.state.load_provider_plugins("provider-id"), {plugin_id: True}
+        )
+
+    def test_malformed_final_config_is_sanitized_and_temp_home_is_removed(self):
+        runtime_home = None
+
+        with mock.patch.dict(os.environ, self.environment(), clear=True):
+            with self.assertRaises(CcSwitchConfigError) as raised:
+                with materialize_codex_runtime(self.provider, None) as runtime:
+                    runtime_home = runtime.home
+                    runtime.config_path.write_text(
+                        "final-config-secret = [", encoding="utf-8"
+                    )
+
+        self.assertIsNotNone(runtime_home)
+        self.assertFalse(runtime_home.exists())
+        self.assertIn("finalize", str(raised.exception))
+        self.assertNotIn("final-config-secret", str(raised.exception))
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+
+    def test_sync_failure_still_removes_temp_home(self):
+        runtime_home = None
+
+        with mock.patch.dict(
+            os.environ, self.environment(), clear=True
+        ), mock.patch.object(
+            PluginStateStore,
+            "apply_runtime_changes",
+            side_effect=OSError("sync-secret"),
+        ):
+            with self.assertRaises(CcSwitchConfigError) as raised:
+                with materialize_codex_runtime(self.provider, None) as runtime:
+                    runtime_home = runtime.home
+
+        self.assertIsNotNone(runtime_home)
+        self.assertFalse(runtime_home.exists())
+        self.assertIn("finalize", str(raised.exception))
+        self.assertNotIn("sync-secret", str(raised.exception))
+
+    def test_body_interrupt_wins_when_sync_and_cleanup_also_fail(self):
+        body_error = KeyboardInterrupt("body interrupt")
+        runtime_home = None
+        real_cleanup = tempfile.TemporaryDirectory.cleanup
+
+        def fail_after_cleanup(directory):
+            real_cleanup(directory)
+            raise OSError("cleanup-secret")
+
+        with mock.patch.dict(
+            os.environ, self.environment(), clear=True
+        ), mock.patch.object(
+            PluginStateStore,
+            "apply_runtime_changes",
+            side_effect=OSError("sync-secret"),
+        ) as synchronize, mock.patch.object(
+            codex_runtime.tempfile.TemporaryDirectory,
+            "cleanup",
+            autospec=True,
+            side_effect=fail_after_cleanup,
+        ):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                with materialize_codex_runtime(self.provider, None) as runtime:
+                    runtime_home = runtime.home
+                    raise body_error
+
+        self.assertIs(raised.exception, body_error)
+        self.assertIsNotNone(runtime_home)
+        self.assertFalse(runtime_home.exists())
+        synchronize.assert_called_once()
+
+
+class UseCodexRuntimeTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.shared_home = self.root / "shared-codex"
+        self.shared_home.mkdir()
+
+    def provider(self, meta=None):
+        return SelectedProvider(
+            "provider-id",
+            "codex",
+            "fengwind",
+            deepcopy(PROVIDER_SETTINGS),
+            meta or {},
+        )
+
+    def install_plugin(self):
+        manifest = (
+            self.shared_home
+            / "plugins"
+            / "cache"
+            / "test"
+            / "demo"
+            / "1.0.0"
+            / ".codex-plugin"
+            / "plugin.json"
+        )
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text(
+            json.dumps({"name": "demo", "version": "1.0.0"}),
+            encoding="utf-8",
+        )
+
+    def test_false_or_missing_common_flag_never_queries_common_config(self):
+        for meta in ({}, {"commonConfigEnabled": False}):
+            with self.subTest(meta=meta), mock.patch.dict(
+                os.environ, {"CODEX_HOME": str(self.shared_home)}, clear=True
+            ), mock.patch.object(
+                codex_runtime, "load_provider", return_value=self.provider(meta)
+            ) as load, mock.patch.object(
+                codex_runtime, "load_common_config"
+            ) as load_common:
+                with codex_runtime.use_codex_runtime(
+                    "fengwind", db_path=self.root / "cc-switch.db"
+                ) as runtime:
+                    config = tomllib.loads(runtime.config_path.read_text())
+
+            self.assertEqual(config["model"], "gpt-provider")
+            load.assert_called_once_with(
+                "codex", "fengwind", self.root / "cc-switch.db"
+            )
+            load_common.assert_not_called()
+
+    def test_true_common_flag_loads_and_merges_common_config(self):
+        provider = self.provider({"commonConfigEnabled": True})
+
+        with mock.patch.dict(
+            os.environ, {"CODEX_HOME": str(self.shared_home)}, clear=True
+        ), mock.patch.object(
+            codex_runtime, "load_provider", return_value=provider
+        ), mock.patch.object(
+            codex_runtime,
+            "load_common_config",
+            return_value='model = "gpt-common"\n',
+        ) as load_common:
+            with codex_runtime.use_codex_runtime(
+                "fengwind", db_path=self.root / "cc-switch.db"
+            ) as runtime:
+                config = tomllib.loads(runtime.config_path.read_text())
+
+        self.assertEqual(config["model"], "gpt-common")
+        load_common.assert_called_once_with(
+            "codex", self.root / "cc-switch.db"
+        )
+
+    def test_reset_flag_is_applied_before_malformed_sidecar_load(self):
+        sidecar_digest = hashlib.sha256(b"provider-id").hexdigest()
+        sidecar = (
+            self.shared_home
+            / ".cc-switch-tui"
+            / "provider-plugins"
+            / f"{sidecar_digest}.json"
+        )
+        sidecar.parent.mkdir(parents=True)
+        sidecar.write_text("not-json", encoding="utf-8")
+
+        with mock.patch.dict(
+            os.environ, {"CODEX_HOME": str(self.shared_home)}, clear=True
+        ), mock.patch.object(
+            codex_runtime, "load_provider", return_value=self.provider()
+        ), mock.patch.object(codex_runtime, "load_common_config") as load_common:
+            with codex_runtime.use_codex_runtime(
+                "fengwind",
+                reset_plugin_state=True,
+                db_path=self.root / "cc-switch.db",
+            ):
+                self.assertFalse(sidecar.exists())
+
+        load_common.assert_not_called()
+
+    def test_sigterm_synchronizes_plugin_change_and_cleans_runtime(self):
+        self.install_plugin()
+        previous_handler = signal.getsignal(signal.SIGTERM)
+        runtime_home = None
+
+        with mock.patch.dict(
+            os.environ, {"CODEX_HOME": str(self.shared_home)}, clear=True
+        ), mock.patch.object(
+            codex_runtime, "load_provider", return_value=self.provider()
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                with codex_runtime.use_codex_runtime("fengwind") as runtime:
+                    runtime_home = runtime.home
+                    CodexRuntimeFinalizationTests.set_plugin(
+                        runtime, "demo@test", True
+                    )
+                    handler = signal.getsignal(signal.SIGTERM)
+                    self.assertTrue(callable(handler))
+                    handler(signal.SIGTERM, None)
+
+        self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+        self.assertIsNotNone(runtime_home)
+        self.assertFalse(runtime_home.exists())
+        self.assertEqual(signal.getsignal(signal.SIGTERM), previous_handler)
+        self.assertEqual(
+            PluginStateStore(self.shared_home).load_provider_plugins(
+                "provider-id"
+            ),
+            {"demo@test": True},
+        )
+
+    def test_windows_is_rejected_before_database_access(self):
+        with mock.patch.object(codex_runtime.os, "name", "nt"), mock.patch.object(
+            codex_runtime, "load_provider"
+        ) as load:
+            with self.assertRaisesRegex(CcSwitchConfigError, "macOS/Linux"):
+                with codex_runtime.use_codex_runtime(
+                    "provider", db_path=Path("never.db")
+                ):
+                    pass
+
+        load.assert_not_called()
 
 
 if __name__ == "__main__":

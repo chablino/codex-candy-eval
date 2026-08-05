@@ -15,14 +15,20 @@ from typing import Any
 import tomli_w
 
 from cc_switch_config import (
+    DEFAULT_DB_PATH,
     CcSwitchConfigError,
     SelectedProvider,
+    _sigterm_as_system_exit,
     _write_private_file,
+    load_common_config,
+    load_provider,
 )
 from codex_plugin_state import (
     PluginStateStore,
+    RuntimeSnapshot,
     compose_effective_config,
     deep_merge,
+    plugin_flags,
     scan_plugin_inventory,
 )
 
@@ -59,6 +65,16 @@ class CodexRuntime:
     config_path: Path
     environment: Mapping[str, str] = field(repr=False)
     warnings: tuple[str, ...]
+
+
+@dataclass
+class _PreparedCodexRuntime:
+    temporary_directory: tempfile.TemporaryDirectory[str]
+    runtime: CodexRuntime
+    state_store: PluginStateStore
+    baseline_plugins: dict[str, bool]
+    initial_snapshot: RuntimeSnapshot
+    shared_plugins: Path
 
 
 def _parse_toml(payload: object) -> dict[str, Any]:
@@ -232,9 +248,10 @@ def _prepare_codex_runtime(
     common_config: str | None,
     *,
     reset_plugin_state: bool = False,
-) -> tuple[tempfile.TemporaryDirectory[str], CodexRuntime]:
+) -> _PreparedCodexRuntime:
     temporary_directory: tempfile.TemporaryDirectory[str] | None = None
     runtime: CodexRuntime | None = None
+    prepared: _PreparedCodexRuntime | None = None
     setup_error: BaseException | None = None
 
     try:
@@ -287,7 +304,8 @@ def _prepare_codex_runtime(
             composed.document, provider.settings.get("auth")
         )
         rendered = tomli_w.dumps(final_document)
-        if tomllib.loads(rendered) != final_document:
+        serialized_document = tomllib.loads(rendered)
+        if serialized_document != final_document:
             raise CcSwitchConfigError("selected Codex configuration is invalid")
 
         temporary_directory = tempfile.TemporaryDirectory(
@@ -311,6 +329,19 @@ def _prepare_codex_runtime(
             environment=environment,
             warnings=composed.warnings,
         )
+        initial_snapshot = RuntimeSnapshot(
+            plugins=plugin_flags(serialized_document),
+            marketplaces=_marketplaces(serialized_document),
+            inventory=inventory,
+        )
+        prepared = _PreparedCodexRuntime(
+            temporary_directory=temporary_directory,
+            runtime=runtime,
+            state_store=state_store,
+            baseline_plugins=composed.baseline_plugins,
+            initial_snapshot=initial_snapshot,
+            shared_plugins=shared_plugins,
+        )
     except BaseException as exc:
         setup_error = exc
 
@@ -327,7 +358,33 @@ def _prepare_codex_runtime(
 
     assert temporary_directory is not None
     assert runtime is not None
-    return temporary_directory, runtime
+    assert prepared is not None
+    return prepared
+
+
+def _synchronize_runtime(prepared: _PreparedCodexRuntime) -> None:
+    final_document = _parse_toml(
+        prepared.runtime.config_path.read_text(encoding="utf-8")
+    )
+    final_snapshot = RuntimeSnapshot(
+        plugins=plugin_flags(final_document),
+        marketplaces=_marketplaces(final_document),
+        inventory=scan_plugin_inventory(prepared.shared_plugins),
+    )
+    prepared.state_store.apply_runtime_changes(
+        prepared.runtime.provider_id,
+        prepared.baseline_plugins,
+        prepared.initial_snapshot,
+        final_snapshot,
+    )
+
+
+def _synchronize_runtime_safely(prepared: _PreparedCodexRuntime) -> bool:
+    try:
+        _synchronize_runtime(prepared)
+    except BaseException:
+        return False
+    return True
 
 
 @contextmanager
@@ -338,20 +395,51 @@ def materialize_codex_runtime(
     reset_plugin_state: bool = False,
 ) -> Iterator[CodexRuntime]:
     """Materialize one complete Codex configuration in a temporary home."""
-    temporary_directory, runtime = _prepare_codex_runtime(
+    prepared = _prepare_codex_runtime(
         provider,
         common_config,
         reset_plugin_state=reset_plugin_state,
     )
     body_failed = False
     try:
-        yield runtime
+        yield prepared.runtime
     except BaseException:
         body_failed = True
         raise
     finally:
-        cleanup_succeeded = _cleanup_temporary_directory(temporary_directory)
-        if not body_failed and not cleanup_succeeded:
+        sync_succeeded = _synchronize_runtime_safely(prepared)
+        cleanup_succeeded = _cleanup_temporary_directory(
+            prepared.temporary_directory
+        )
+        if not body_failed and (not sync_succeeded or not cleanup_succeeded):
             raise CcSwitchConfigError(
-                "failed to clean up selected Codex runtime"
+                "failed to finalize selected Codex runtime"
             )
+
+
+@contextmanager
+def use_codex_runtime(
+    selector: str,
+    *,
+    reset_plugin_state: bool = False,
+    db_path: str | Path = DEFAULT_DB_PATH,
+) -> Iterator[CodexRuntime]:
+    """Select one Codex provider and materialize its complete runtime."""
+    if os.name == "nt":
+        raise CcSwitchConfigError(
+            "--cc-switch-config is currently supported only on macOS/Linux"
+        )
+
+    provider = load_provider("codex", selector, db_path)
+    common_config = (
+        load_common_config("codex", db_path)
+        if provider.meta.get("commonConfigEnabled") is True
+        else None
+    )
+    with _sigterm_as_system_exit():
+        with materialize_codex_runtime(
+            provider,
+            common_config,
+            reset_plugin_state=reset_plugin_state,
+        ) as runtime:
+            yield runtime
