@@ -56,10 +56,12 @@ provider；它不会读取或改变 App 当前选中的 provider，也不会修�
 `Apply Common Config` 就完全不会并入 Common Config。
 
 每次启动都会创建独立的临时 `CODEX_HOME`，其中包含这次运行的完整 `config.toml`，不使用
-Codex profile。provider 的 token 只通过该子进程的 `OPENAI_API_KEY` 注入，临时配置只保存
-环境变量名称。共享 `CODEX_HOME`（未设置时为 `~/.codex`）中的默认 `config.toml`、
-`auth.json` 和 CC Switch 配置都不会被覆盖；正常退出、异常、Ctrl-C 或 SIGTERM 后，插件状态
-同步完成再删除临时目录。
+Codex profile。provider 的 token 通过该子进程的 `OPENAI_API_KEY` 注入，并写入本次临时
+home 中权限为 `0600` 的 `auth.json`；临时 `config.toml` 只保存环境变量名称。这个认证文件
+让 launcher 与正常直接运行的 Codex 使用相同的 API-key curated marketplace。共享
+`CODEX_HOME`（未设置时为 `~/.codex`）中的默认 `config.toml`、`auth.json` 和 CC Switch
+配置都不会被覆盖；正常退出、异常、Ctrl-C 或 SIGTERM 后，插件状态同步完成再删除整个临时
+目录及其中的认证文件。
 
 不同 provider 仍共享 sessions、SQLite 状态、history、skills、rules、memories 和插件目录，
 所以可以跨 provider 使用 `resume`。每个并发窗口都有独立临时配置；插件开关在退出时按实际
@@ -78,7 +80,8 @@ Codex profile。provider 的 token 只通过该子进程的 `OPENAI_API_KEY` 注
 
 当前 `superpowers` 的 canonical ID 是 `superpowers@openai-api-curated`。
 `superpowers@openai-curated` 是旧 marketplace ID，启动器会将旧配置声明归一化为 canonical
-ID，并忽略旧 ID 的缓存，避免同时加载两份。
+ID。`openai-curated` 完整目录的缓存不会被当作 launcher 的已安装 inventory，避免把其中的
+Figma、GitHub、HyperFrames 或另一份 Superpowers 错误注入当前 provider 配置。
 
 如果只想清除某个 provider 通过启动器保存的插件开关，让它重新采用 provider 配置与
 Common Config 的默认值，可以使用：
