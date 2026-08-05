@@ -51,9 +51,11 @@ python3 /path/to/codex-candy-eval/codex_tui.py \
 
 启动器只查找 `app_type=codex` 的 provider，并从 CC Switch SQLite 数据库只读加载指定
 provider；它不会读取或改变 App 当前选中的 provider，也不会修改数据库。最终配置按以下顺序
-生成：provider 原始配置；仅当该 provider 在 CC Switch 中开启 `Apply Common Config` 时，
-再结构化合并 Codex Common Config；最后叠加该 provider 自己的插件开关。因此，未开启
-`Apply Common Config` 就完全不会并入 Common Config。
+生成：先应用项目 `codex_plugin_defaults.toml` 中当前确实已安装的默认插件开关；再叠加
+provider 原始配置；仅当该 provider 在 CC Switch 中开启 `Apply Common Config` 时，再结构化
+合并 Codex Common Config；最后叠加该 provider 自己的 `/plugins` 开关。因此，未开启
+`Apply Common Config` 就完全不会并入 Common Config，provider、Common Config 和 sidecar
+也都可以覆盖项目默认开关。
 
 每次启动都会创建独立的临时 `CODEX_HOME`，其中包含这次运行的完整 `config.toml`，不使用
 Codex profile。provider 的 token 通过该子进程的 `OPENAI_API_KEY` 注入，并写入本次临时
@@ -70,13 +72,26 @@ home 中权限为 `0600` 的 `auth.json`；临时 `config.toml` 只保存环境�
 插件的安装和删除是全局的，启用和关闭是按 provider 保存的：
 
 - 在某个 provider 的 `/plugins` 中安装插件，会把插件安装到共享插件目录，并只为当前
-  provider 启用；其他 provider 能看到这个已安装插件，但默认不会自动启用。
+  provider 启用；其他 provider 能看到这个已安装插件。若它不在项目默认文件中，其他
+  provider 仍默认不会自动启用。
 - 在 `/plugins` 中关闭或重新开启插件，只更新当前 provider 的开关。开关保存在共享
   `CODEX_HOME/.cc-switch-tui/provider-plugins/`，不写入 CC Switch 数据库。
 - 在 `/plugins` 中删除插件，会从共享插件目录全局删除，并清除所有 provider 对它保存的
   开关。
 - provider 配置或已启用的 Common Config 可以声明插件的默认开关；当前 provider 后续在
   `/plugins` 中做出的开关变化优先于这个默认值。
+
+`codex_plugin_defaults.toml` 是 anyrouter 当前 8 个开启插件的一次性快照，包含 Superpowers、
+documents、pdf、presentations、template-creator、spreadsheets、visualize 和 browser。它不会
+读取 anyrouter provider，也不会随 anyrouter 后续修改而变化；要改变这份稳定默认值，应直接
+编辑该文件。默认文件不是安装清单：只有共享 inventory 中已安装的条目才进入临时配置。全局
+卸载其中一个插件后，launcher 不会自动下载，也不会报告默认插件缺失；将来全局重新安装后，
+该插件会再次按文件中的 `enabled` 值成为默认开关。
+
+插件开关的完整覆盖顺序从低到高为：已安装的项目默认值、provider 原始配置、开启
+`Apply Common Config` 时的 Common Config、当前 provider 的 `/plugins` sidecar。默认值、
+provider 与可选 Common Config 共同构成 baseline，因此关闭默认插件只会为当前 provider
+保存一个稀疏的 `false`；恢复到 baseline 后，这条 provider 覆盖会自动删除。
 
 当前 `superpowers` 的 canonical ID 是 `superpowers@openai-api-curated`。
 `superpowers@openai-curated` 是旧 marketplace ID，启动器会将旧配置声明归一化为 canonical
