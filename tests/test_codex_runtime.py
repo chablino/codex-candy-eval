@@ -42,6 +42,128 @@ PROVIDER_SETTINGS = {
     "config": PROVIDER_CONFIG,
     "auth": {"OPENAI_API_KEY": "provider-secret"},
 }
+EXPECTED_DEFAULT_PLUGINS = {
+    "superpowers@openai-api-curated",
+    "documents@openai-primary-runtime",
+    "pdf@openai-primary-runtime",
+    "presentations@openai-primary-runtime",
+    "template-creator@openai-primary-runtime",
+    "spreadsheets@openai-primary-runtime",
+    "visualize@openai-bundled",
+    "browser@openai-bundled",
+}
+
+
+class DefaultPluginConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+
+    def test_project_defaults_are_the_eight_anyrouter_plugins(self):
+        defaults = codex_runtime._load_default_plugin_config()
+
+        self.assertEqual(set(defaults), EXPECTED_DEFAULT_PLUGINS)
+        self.assertTrue(all(defaults.values()))
+
+    def test_project_defaults_are_loaded_independently_of_working_directory(self):
+        previous = Path.cwd()
+        try:
+            os.chdir(self.root)
+            defaults = codex_runtime._load_default_plugin_config()
+        finally:
+            os.chdir(previous)
+
+        self.assertEqual(set(defaults), EXPECTED_DEFAULT_PLUGINS)
+        self.assertEqual(
+            codex_runtime._DEFAULT_PLUGIN_CONFIG_PATH,
+            Path(codex_runtime.__file__).with_name("codex_plugin_defaults.toml"),
+        )
+
+    def test_missing_symlink_and_directory_default_files_are_rejected(self):
+        missing = self.root / "missing.toml"
+        directory = self.root / "directory.toml"
+        directory.mkdir()
+        target = self.root / "target.toml"
+        target.write_text("[plugins]\n", encoding="utf-8")
+        symlink = self.root / "symlink.toml"
+        symlink.symlink_to(target)
+
+        for path in (missing, directory, symlink):
+            with self.subTest(path=path.name), mock.patch.object(
+                codex_runtime, "_DEFAULT_PLUGIN_CONFIG_PATH", path
+            ):
+                with self.assertRaises(CcSwitchConfigError) as raised:
+                    codex_runtime._load_default_plugin_config()
+
+                self.assertEqual(
+                    str(raised.exception),
+                    "Codex default plugin configuration is invalid",
+                )
+
+    def test_invalid_default_file_contents_are_sanitized(self):
+        cases = (
+            ("secret-malformed = [", "secret-malformed"),
+            ('[other]\nvalue = "secret-top-level"\n', "secret-top-level"),
+            (
+                '[plugins]\n"demo@test" = "secret-not-table"\n',
+                "secret-not-table",
+            ),
+            (
+                '[plugins."demo@test"]\n'
+                'enabled = true\nextra = "secret-extra"\n',
+                "secret-extra",
+            ),
+            (
+                '[plugins."demo@test"]\nenabled = "secret-boolean"\n',
+                "secret-boolean",
+            ),
+            ('[plugins.""]\nenabled = true\n', "defaults.toml"),
+        )
+
+        path = self.root / "defaults.toml"
+        for payload, secret in cases:
+            with self.subTest(secret=secret):
+                path.write_text(payload, encoding="utf-8")
+                with mock.patch.object(
+                    codex_runtime, "_DEFAULT_PLUGIN_CONFIG_PATH", path
+                ):
+                    with self.assertRaises(CcSwitchConfigError) as raised:
+                        codex_runtime._load_default_plugin_config()
+
+                self.assertEqual(
+                    str(raised.exception),
+                    "Codex default plugin configuration is invalid",
+                )
+                self.assertNotIn(secret, str(raised.exception))
+                self.assertIsNone(raised.exception.__cause__)
+
+    def test_canonical_superpowers_default_wins_over_legacy_in_any_order(self):
+        payloads = (
+            f'''\
+[plugins."superpowers@openai-curated"]
+enabled = false
+[plugins."{CANONICAL_SUPERPOWERS_ID}"]
+enabled = true
+''',
+            f'''\
+[plugins."{CANONICAL_SUPERPOWERS_ID}"]
+enabled = true
+[plugins."superpowers@openai-curated"]
+enabled = false
+''',
+        )
+        path = self.root / "defaults.toml"
+
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                path.write_text(payload, encoding="utf-8")
+                with mock.patch.object(
+                    codex_runtime, "_DEFAULT_PLUGIN_CONFIG_PATH", path
+                ):
+                    defaults = codex_runtime._load_default_plugin_config()
+
+                self.assertEqual(defaults, {CANONICAL_SUPERPOWERS_ID: True})
 
 
 class CodexRuntimeMaterializationTests(unittest.TestCase):

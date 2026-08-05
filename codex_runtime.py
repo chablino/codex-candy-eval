@@ -25,10 +25,13 @@ from cc_switch_config import (
     load_provider,
 )
 from codex_plugin_state import (
+    CANONICAL_SUPERPOWERS_ID,
+    LEGACY_SUPERPOWERS_ID,
     PluginStateStore,
     RuntimeSnapshot,
     compose_effective_config,
     deep_merge,
+    normalize_plugin_id,
     plugin_flags,
     scan_plugin_inventory,
 )
@@ -55,6 +58,9 @@ FILE_SHARE_ALLOWLIST = (
 _CODEX_API_KEY_ERROR = (
     "Codex TUI launcher supports only adaptable CC Switch providers with a "
     "single OPENAI_API_KEY"
+)
+_DEFAULT_PLUGIN_CONFIG_PATH = Path(__file__).with_name(
+    "codex_plugin_defaults.toml"
 )
 
 
@@ -138,6 +144,47 @@ def _read_shared_config(shared_home: Path) -> dict[str, Any]:
     if parsed is None:
         raise CcSwitchConfigError("shared Codex configuration is invalid")
     return parsed
+
+
+def _load_default_plugin_config() -> dict[str, bool]:
+    path = _DEFAULT_PLUGIN_CONFIG_PATH
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise OSError("default plugin config is not a regular file")
+        document = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError, RecursionError):
+        raise CcSwitchConfigError(
+            "Codex default plugin configuration is invalid"
+        ) from None
+
+    if set(document) != {"plugins"}:
+        raise CcSwitchConfigError(
+            "Codex default plugin configuration is invalid"
+        )
+    plugins = document["plugins"]
+    if not isinstance(plugins, Mapping):
+        raise CcSwitchConfigError(
+            "Codex default plugin configuration is invalid"
+        )
+
+    defaults: dict[str, bool] = {}
+    canonical_is_explicit = CANONICAL_SUPERPOWERS_ID in plugins
+    for plugin_id, entry in plugins.items():
+        if (
+            not isinstance(plugin_id, str)
+            or not plugin_id
+            or "\0" in plugin_id
+            or not isinstance(entry, Mapping)
+            or set(entry) != {"enabled"}
+            or not isinstance(entry["enabled"], bool)
+        ):
+            raise CcSwitchConfigError(
+                "Codex default plugin configuration is invalid"
+            )
+        if plugin_id == LEGACY_SUPERPOWERS_ID and canonical_is_explicit:
+            continue
+        defaults[normalize_plugin_id(plugin_id)] = entry["enabled"]
+    return defaults
 
 
 def _marketplaces(document: Mapping[str, Any]) -> dict[str, Any]:
