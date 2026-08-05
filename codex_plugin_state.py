@@ -120,13 +120,32 @@ def compose_effective_config(
     launcher_marketplaces: Mapping[str, Any],
     inventory: set[str] | frozenset[str],
     provider_plugins: Mapping[str, bool],
+    default_plugins: Mapping[str, bool] | None = None,
 ) -> ComposedConfig:
     """Build one provider's complete config and its plugin baseline."""
+    normalized_inventory = _normalized_inventory(inventory)
+    installed_defaults = {
+        plugin_id: {"enabled": enabled}
+        for plugin_id, enabled in _normalized_plugin_overrides(
+            default_plugins or {}
+        ).items()
+        if plugin_id in normalized_inventory
+    }
+
     document = deepcopy(dict(provider))
     if common_enabled and common is not None:
         document = deep_merge(document, common)
 
-    plugins = _normalized_plugin_entries(document)
+    plugins = installed_defaults
+    plugin_layers = [_normalized_plugin_entries(provider)]
+    if common_enabled and common is not None:
+        plugin_layers.append(_normalized_plugin_entries(common))
+    for layer in plugin_layers:
+        for plugin_id, entry in layer.items():
+            plugins[plugin_id] = deep_merge(
+                plugins.get(plugin_id, {}), entry
+            )
+
     baseline_plugins = {
         plugin_id: entry.get("enabled", True)
         for plugin_id, entry in plugins.items()
@@ -139,12 +158,6 @@ def compose_effective_config(
         document["marketplaces"] = deep_merge(
             marketplaces, launcher_marketplaces
         )
-
-    normalized_inventory: set[str] = set()
-    for plugin_id in inventory:
-        if not isinstance(plugin_id, str):
-            raise CodexPluginStateError("plugin inventory IDs must be text")
-        normalized_inventory.add(normalize_plugin_id(plugin_id))
 
     for plugin_id in sorted(normalized_inventory):
         plugins.setdefault(plugin_id, {"enabled": False})
@@ -300,7 +313,9 @@ def _reject_json_constant(_constant: str) -> None:
     raise ValueError("non-standard JSON constant")
 
 
-def _normalized_inventory(inventory: frozenset[str]) -> frozenset[str]:
+def _normalized_inventory(
+    inventory: set[str] | frozenset[str],
+) -> frozenset[str]:
     normalized: set[str] = set()
     for plugin_id in inventory:
         if not isinstance(plugin_id, str):

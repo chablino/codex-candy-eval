@@ -106,6 +106,114 @@ class EffectiveConfigTests(unittest.TestCase):
         self.assertEqual(plugin_flags(overridden.document), {"demo@test": True})
         self.assertEqual(initial.baseline_plugins, {})
 
+    def test_installed_defaults_are_enabled_and_enter_baseline(self):
+        result = compose_effective_config(
+            {},
+            None,
+            False,
+            {},
+            {"demo@test"},
+            {},
+            default_plugins={"demo@test": True},
+        )
+
+        self.assertEqual(plugin_flags(result.document), {"demo@test": True})
+        self.assertEqual(result.baseline_plugins, {"demo@test": True})
+        self.assertEqual(result.warnings, ())
+
+    def test_default_missing_from_inventory_is_silently_omitted(self):
+        result = compose_effective_config(
+            {},
+            None,
+            False,
+            {},
+            set(),
+            {},
+            default_plugins={"missing@test": True},
+        )
+
+        self.assertNotIn("plugins", result.document)
+        self.assertEqual(result.baseline_plugins, {})
+        self.assertEqual(result.warnings, ())
+
+    def test_plugin_precedence_is_default_provider_common_then_sidecar(self):
+        result = compose_effective_config(
+            {
+                "plugins": {
+                    "demo@test": {
+                        "enabled": False,
+                        "provider_option": "kept",
+                    }
+                }
+            },
+            {
+                "plugins": {
+                    "demo@test": {
+                        "enabled": True,
+                        "common_option": "kept",
+                    }
+                }
+            },
+            True,
+            {},
+            {"demo@test"},
+            {"demo@test": False},
+            default_plugins={"demo@test": True},
+        )
+
+        entry = result.document["plugins"]["demo@test"]
+        self.assertFalse(entry["enabled"])
+        self.assertEqual(entry["provider_option"], "kept")
+        self.assertEqual(entry["common_option"], "kept")
+        self.assertEqual(result.baseline_plugins, {"demo@test": True})
+
+    def test_canonical_default_superpowers_id_wins_over_legacy(self):
+        result = compose_effective_config(
+            {},
+            None,
+            False,
+            {},
+            {CANONICAL_SUPERPOWERS_ID},
+            {},
+            default_plugins={
+                "superpowers@openai-curated": False,
+                CANONICAL_SUPERPOWERS_ID: True,
+            },
+        )
+
+        self.assertEqual(
+            plugin_flags(result.document),
+            {CANONICAL_SUPERPOWERS_ID: True},
+        )
+        self.assertEqual(
+            result.baseline_plugins,
+            {CANONICAL_SUPERPOWERS_ID: True},
+        )
+
+    def test_legacy_provider_id_overrides_canonical_default_layer(self):
+        result = compose_effective_config(
+            {
+                "plugins": {
+                    "superpowers@openai-curated": {"enabled": False}
+                }
+            },
+            None,
+            False,
+            {},
+            {CANONICAL_SUPERPOWERS_ID},
+            {},
+            default_plugins={CANONICAL_SUPERPOWERS_ID: True},
+        )
+
+        self.assertEqual(
+            plugin_flags(result.document),
+            {CANONICAL_SUPERPOWERS_ID: False},
+        )
+        self.assertEqual(
+            result.baseline_plugins,
+            {CANONICAL_SUPERPOWERS_ID: False},
+        )
+
     def test_plugin_without_enabled_defaults_to_true(self):
         result = compose_effective_config(
             {"plugins": {"demo@test": {"custom": "value"}}},
