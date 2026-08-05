@@ -142,7 +142,14 @@ enabled = true
                 self.assertFalse(selected["requires_openai_auth"])
                 self.assertEqual(selected["env_key"], "OPENAI_API_KEY")
                 self.assertNotIn("provider-secret", config_text)
-                self.assertFalse((runtime_home / "auth.json").exists())
+                auth_path = runtime_home / "auth.json"
+                self.assertTrue(auth_path.is_file())
+                self.assertFalse(auth_path.is_symlink())
+                self.assertEqual(
+                    json.loads(auth_path.read_text(encoding="utf-8")),
+                    {"OPENAI_API_KEY": "provider-secret"},
+                )
+                self.assertEqual(stat.S_IMODE(auth_path.stat().st_mode), 0o600)
                 self.assertEqual(stat.S_IMODE(runtime_home.stat().st_mode), 0o700)
                 self.assertEqual(
                     stat.S_IMODE(runtime.config_path.stat().st_mode), 0o600

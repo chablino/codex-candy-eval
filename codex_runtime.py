@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import tomllib
@@ -150,7 +151,7 @@ def _marketplaces(document: Mapping[str, Any]) -> dict[str, Any]:
 
 def _codex_auth_parts(
     document: Mapping[str, Any], auth: object
-) -> tuple[dict[str, Any], dict[str, str]]:
+) -> tuple[dict[str, Any], dict[str, str], dict[str, str]]:
     if (
         not isinstance(auth, dict)
         or set(auth) != {"OPENAI_API_KEY"}
@@ -179,7 +180,12 @@ def _codex_auth_parts(
     selected = transformed["model_providers"][provider_id]
     selected["requires_openai_auth"] = False
     selected["env_key"] = "OPENAI_API_KEY"
-    return transformed, {"OPENAI_API_KEY": auth["OPENAI_API_KEY"]}
+    api_key = auth["OPENAI_API_KEY"]
+    return (
+        transformed,
+        {"OPENAI_API_KEY": api_key},
+        {"OPENAI_API_KEY": api_key},
+    )
 
 
 def _prepare_shared_targets(shared_home: Path) -> dict[str, Path]:
@@ -300,10 +306,11 @@ def _prepare_codex_runtime(
             inventory,
             provider_plugins,
         )
-        final_document, auth_environment = _codex_auth_parts(
+        final_document, auth_environment, auth_document = _codex_auth_parts(
             composed.document, provider.settings.get("auth")
         )
         rendered = tomli_w.dumps(final_document)
+        rendered_auth = json.dumps(auth_document, separators=(",", ":")) + "\n"
         serialized_document = tomllib.loads(rendered)
         if serialized_document != final_document:
             raise CcSwitchConfigError("selected Codex configuration is invalid")
@@ -316,6 +323,7 @@ def _prepare_codex_runtime(
         _link_shared_targets(runtime_home, targets)
         config_path = runtime_home / "config.toml"
         _write_private_file(config_path, rendered)
+        _write_private_file(runtime_home / "auth.json", rendered_auth)
 
         environment["CODEX_HOME"] = str(runtime_home)
         environment["CODEX_SQLITE_HOME"] = str(shared_sqlite_home)
