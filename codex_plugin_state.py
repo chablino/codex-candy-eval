@@ -199,6 +199,7 @@ def scan_plugin_inventory(plugins_root: Path) -> frozenset[str]:
             not marketplace.is_dir()
             or marketplace.is_symlink()
             or not _safe_path_segment(marketplace.name)
+            or marketplace.name == "openai-curated"
         ):
             continue
         for plugin in _directories(marketplace):
@@ -206,11 +207,6 @@ def scan_plugin_inventory(plugins_root: Path) -> frozenset[str]:
                 not plugin.is_dir()
                 or plugin.is_symlink()
                 or not _safe_path_segment(plugin.name)
-            ):
-                continue
-            if (
-                marketplace.name == "openai-curated"
-                and plugin.name == "superpowers"
             ):
                 continue
             for version in _directories(plugin):

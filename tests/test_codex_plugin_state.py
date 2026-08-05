@@ -211,8 +211,9 @@ class PluginInventoryTests(unittest.TestCase):
 
         self.assertEqual(scan_plugin_inventory(self.plugins_root), {"demo@test"})
 
-    def test_legacy_superpowers_cache_is_ignored_and_canonical_is_discovered(self):
+    def test_full_curated_cache_is_ignored_and_api_curated_is_discovered(self):
         self.install("openai-curated", "superpowers")
+        self.install("openai-curated", "figma")
         self.install("openai-api-curated", "superpowers")
 
         self.assertEqual(
