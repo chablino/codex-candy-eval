@@ -20,6 +20,7 @@ from cc_switch_config import (
     SelectedProvider,
     _sigterm_as_system_exit,
     _write_private_file,
+    load_common_config,
     load_provider,
     materialize_codex_profile,
     materialize_provider,
@@ -70,21 +71,36 @@ class ProviderDatabase:
                 id TEXT NOT NULL,
                 app_type TEXT NOT NULL,
                 name TEXT NOT NULL,
-                settings_config TEXT NOT NULL
+                settings_config TEXT NOT NULL,
+                meta TEXT NOT NULL DEFAULT '{}'
             )
         """
         with closing(sqlite3.connect(self.path)) as connection:
             with connection:
                 connection.execute(schema)
 
-    def insert(self, provider_id, app_type, name, settings):
+    def insert(self, provider_id, app_type, name, settings, meta=None):
         payload = settings if isinstance(settings, str) else json.dumps(settings)
+        meta_payload = meta if isinstance(meta, str) else json.dumps(meta or {})
         with closing(sqlite3.connect(self.path)) as connection:
             with connection:
                 connection.execute(
                     "INSERT INTO providers "
-                    "(id, app_type, name, settings_config) VALUES (?, ?, ?, ?)",
-                    (provider_id, app_type, name, payload),
+                    "(id, app_type, name, settings_config, meta) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (provider_id, app_type, name, payload, meta_payload),
+                )
+
+    def set_setting(self, key, value):
+        with closing(sqlite3.connect(self.path)) as connection:
+            with connection:
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS settings "
+                    "(key TEXT PRIMARY KEY, value TEXT)"
+                )
+                connection.execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                    (key, value),
                 )
 
     def close(self):
@@ -141,6 +157,67 @@ class LoadProviderTests(unittest.TestCase):
 
         self.assertIsInstance(selected, SelectedProvider)
         self.assertNotIn("codex-test-secret", repr(selected))
+
+    def test_codex_provider_parses_common_config_flag_from_meta(self):
+        self.database.insert(
+            "codex-id",
+            "codex",
+            "fengwind",
+            CODEX_SETTINGS,
+            meta={"commonConfigEnabled": True},
+        )
+
+        selected = load_provider("codex", "fengwind", self.database.path)
+
+        self.assertEqual(selected.meta, {"commonConfigEnabled": True})
+        self.assertNotIn("codex-test-secret", repr(selected))
+
+    def test_codex_provider_rejects_non_boolean_common_config_flag(self):
+        self.database.insert(
+            "codex-id",
+            "codex",
+            "bad",
+            CODEX_SETTINGS,
+            meta={"commonConfigEnabled": "true"},
+        )
+
+        with self.assertRaisesRegex(CcSwitchConfigError, "metadata"):
+            load_provider("codex", "bad", self.database.path)
+
+    def test_common_config_is_read_from_settings_in_read_only_mode(self):
+        self.database.set_setting("common_config_codex", 'model = "common"\n')
+        real_connect = sqlite3.connect
+        calls = []
+        connections = []
+
+        def recording_connect(*args, **kwargs):
+            calls.append((args, kwargs))
+            connection = RecordingConnection(real_connect(*args, **kwargs))
+            connections.append(connection)
+            return connection
+
+        with mock.patch.object(cc_switch_config.sqlite3, "connect", recording_connect):
+            common = load_common_config("codex", self.database.path)
+
+        self.assertEqual(common, 'model = "common"\n')
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0][0][0].startswith("file:"))
+        self.assertIn("mode=ro", calls[0][0][0])
+        self.assertEqual(calls[0][1], {"uri": True})
+        self.assertTrue(connections[0].closed)
+        self.assertTrue(
+            all(
+                statement.lstrip().upper().startswith(("SELECT", "PRAGMA"))
+                for statement in connections[0].statements
+            )
+        )
+
+    def test_missing_common_config_is_a_sanitized_error(self):
+        with self.assertRaisesRegex(CcSwitchConfigError, "Common Config") as raised:
+            load_common_config("codex", self.database.path)
+
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
 
     def test_duplicate_name_lists_ids_without_settings(self):
         self.database.insert("second", "codex", "same", CODEX_SETTINGS)
@@ -229,6 +306,13 @@ class LoadProviderTests(unittest.TestCase):
         self.assertTrue(all("mode=ro" in args[0] for args, _ in calls))
         self.assertTrue(all(kwargs == {"uri": True} for _, kwargs in calls))
         self.assertTrue(all(connection.closed for connection in connections))
+        self.assertTrue(
+            all(
+                statement.lstrip().upper().startswith(("SELECT", "PRAGMA"))
+                for connection in connections
+                for statement in connection.statements
+            )
+        )
 
     def test_missing_database_is_not_created(self):
         missing = Path(self.database.directory.name) / "missing.db"
@@ -281,8 +365,14 @@ class LoadProviderTests(unittest.TestCase):
         with closing(sqlite3.connect(self.database.path)) as connection:
             with connection:
                 connection.execute(
-                    "INSERT INTO providers VALUES (?, ?, ?, ?)",
-                    ("binary", "claude", "binary", sqlite3.Binary(b"{}")),
+                    "INSERT INTO providers VALUES (?, ?, ?, ?, ?)",
+                    (
+                        "binary",
+                        "claude",
+                        "binary",
+                        sqlite3.Binary(b"{}"),
+                        "{}",
+                    ),
                 )
         self.database.insert("array", "claude", "array", '["secret-value"]')
 
@@ -327,12 +417,13 @@ class LoadProviderTests(unittest.TestCase):
         with closing(sqlite3.connect(self.database.path)) as connection:
             with connection:
                 connection.execute(
-                    "INSERT INTO providers VALUES (?, ?, ?, ?)",
+                    "INSERT INTO providers VALUES (?, ?, ?, ?, ?)",
                     (
                         "binary-name",
                         "codex",
                         sqlite3.Binary(b"bad-name"),
                         json.dumps({"config": secret, "auth": {}}),
+                        "{}",
                     ),
                 )
 

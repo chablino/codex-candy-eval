@@ -22,7 +22,7 @@ AppType = Literal["codex", "claude"]
 
 DEFAULT_DB_PATH = Path.home() / ".cc-switch" / "cc-switch.db"
 REQUIRED_PROVIDER_COLUMNS = frozenset(
-    {"id", "app_type", "name", "settings_config"}
+    {"id", "app_type", "name", "settings_config", "meta"}
 )
 
 
@@ -36,6 +36,7 @@ class SelectedProvider:
     app_type: AppType
     name: str
     settings: dict[str, Any] = field(repr=False)
+    meta: dict[str, Any] = field(default_factory=dict, repr=False)
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,19 @@ class ClaudeProfileRuntime:
 
 def _open_read_only(db_path: Path) -> sqlite3.Connection:
     return sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+
+
+def _resolve_database_path(db_path: str | Path) -> Path:
+    try:
+        resolved_path = Path(db_path).expanduser().resolve()
+        is_file = resolved_path.is_file()
+    except OSError:
+        raise CcSwitchConfigError("failed to inspect CC Switch database path") from None
+    if not is_file:
+        raise CcSwitchConfigError(
+            f"CC Switch database path is not a file: {resolved_path}"
+        )
+    return resolved_path
 
 
 def _read_provider_metadata(
@@ -152,14 +166,14 @@ def _read_provider_payload(
     provider_id: str,
     name: str,
     db_path: Path,
-) -> object:
+) -> tuple[object, object]:
     connection: sqlite3.Connection | None = None
     try:
         connection = _open_read_only(db_path)
         rows = list(
             connection.execute(
                 """
-                SELECT settings_config
+                SELECT settings_config, meta
                 FROM providers
                 WHERE app_type = ? AND id = ? AND name = ?
                 """,
@@ -170,7 +184,7 @@ def _read_provider_payload(
             raise CcSwitchConfigError(
                 f"selected {app_type} provider {provider_id!r} is no longer unique"
             )
-        return rows[0][0]
+        return rows[0]
     except CcSwitchConfigError:
         raise
     except sqlite3.Error:
@@ -228,6 +242,30 @@ def _parse_settings(
     return settings
 
 
+def _parse_provider_meta(
+    app_type: AppType, provider_id: str, payload: object
+) -> dict[str, Any]:
+    if not isinstance(payload, str):
+        raise CcSwitchConfigError(
+            f"provider {provider_id!r} metadata must contain a JSON object"
+        )
+    try:
+        meta = json.loads(payload, parse_constant=_reject_json_constant)
+    except (json.JSONDecodeError, RecursionError, ValueError):
+        meta = None
+    if not isinstance(meta, dict):
+        raise CcSwitchConfigError(
+            f"provider {provider_id!r} metadata must contain a JSON object"
+        )
+    enabled = meta.get("commonConfigEnabled")
+    if app_type == "codex" and enabled is not None and not isinstance(enabled, bool):
+        raise CcSwitchConfigError(
+            f"Codex provider {provider_id!r} metadata "
+            "commonConfigEnabled must be boolean"
+        )
+    return meta
+
+
 def load_provider(
     app_type: AppType,
     selector: str,
@@ -237,23 +275,50 @@ def load_provider(
     if app_type not in ("codex", "claude"):
         raise CcSwitchConfigError(f"unsupported app type: {app_type!r}")
 
-    try:
-        resolved_path = Path(db_path).expanduser().resolve()
-        is_file = resolved_path.is_file()
-    except OSError:
-        raise CcSwitchConfigError("failed to inspect CC Switch database path") from None
-    if not is_file:
-        raise CcSwitchConfigError(
-            f"CC Switch database path is not a file: {resolved_path}"
-        )
+    resolved_path = _resolve_database_path(db_path)
 
     rows = _read_provider_metadata(app_type, resolved_path)
     provider_id, name = _select_row(app_type, selector, rows)
-    payload = _read_provider_payload(
+    settings_payload, meta_payload = _read_provider_payload(
         app_type, provider_id, name, resolved_path
     )
-    settings = _parse_settings(app_type, provider_id, payload)
-    return SelectedProvider(provider_id, app_type, name, settings)
+    settings = _parse_settings(app_type, provider_id, settings_payload)
+    meta = _parse_provider_meta(app_type, provider_id, meta_payload)
+    return SelectedProvider(provider_id, app_type, name, settings, meta)
+
+
+def load_common_config(
+    app_type: AppType, db_path: str | Path = DEFAULT_DB_PATH
+) -> str:
+    """Read the selected app's Common Config without mutating CC Switch."""
+    if app_type != "codex":
+        raise CcSwitchConfigError(
+            f"unsupported Common Config app type: {app_type!r}"
+        )
+
+    resolved_path = _resolve_database_path(db_path)
+    connection: sqlite3.Connection | None = None
+    rows: list[tuple[object, ...]] = []
+    read_failed = False
+    try:
+        connection = _open_read_only(resolved_path)
+        rows = list(
+            connection.execute(
+                "SELECT value FROM settings WHERE key = ?",
+                ("common_config_codex",),
+            )
+        )
+    except sqlite3.Error:
+        read_failed = True
+    finally:
+        if connection is not None:
+            connection.close()
+
+    if read_failed:
+        raise CcSwitchConfigError("failed to read Codex Common Config")
+    if len(rows) != 1 or not isinstance(rows[0][0], str):
+        raise CcSwitchConfigError("Codex Common Config is missing or invalid")
+    return rows[0][0]
 
 
 def _write_private_file(path: Path, content: str) -> None:
