@@ -8,14 +8,12 @@ import re
 import signal
 import sqlite3
 import tempfile
-import tomllib
 from collections.abc import Iterator, Mapping, Sequence
 from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
-from uuid import uuid4
 
 
 AppType = Literal["codex", "claude"]
@@ -48,14 +46,6 @@ class ProviderRuntime:
 
     def redact(self, text: str) -> str:
         return redact_text(text, self.secrets)
-
-
-@dataclass(frozen=True)
-class CodexProfileRuntime:
-    provider_id: str
-    provider_name: str
-    profile_name: str
-    environment: Mapping[str, str] = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -444,183 +434,6 @@ def materialize_provider(provider: SelectedProvider) -> Iterator[ProviderRuntime
             )
 
 
-_CODEX_API_KEY_ERROR = (
-    "Codex TUI launcher supports only adaptable CC Switch profiles with a "
-    "single OPENAI_API_KEY"
-)
-_CODEX_OPENAI_AUTH_ASSIGNMENT = re.compile(
-    r"(?m)^(?P<indent>[ \t]*)"
-    r"requires_openai_auth[ \t]*=[ \t]*true"
-    r"(?P<comment>[ \t]*(?:#.*)?)$"
-)
-
-
-def _parse_codex_toml(config: object) -> dict[str, Any] | None:
-    if not isinstance(config, str):
-        return None
-    try:
-        return tomllib.loads(config)
-    except (tomllib.TOMLDecodeError, RecursionError):
-        return None
-
-
-def _codex_api_key_profile(
-    config: object, auth: object
-) -> tuple[dict[str, str], str]:
-    if (
-        not isinstance(auth, dict)
-        or set(auth) != {"OPENAI_API_KEY"}
-        or not isinstance(auth.get("OPENAI_API_KEY"), str)
-        or "\0" in auth["OPENAI_API_KEY"]
-    ):
-        raise CcSwitchConfigError(_CODEX_API_KEY_ERROR)
-
-    parsed = _parse_codex_toml(config)
-    if parsed is None:
-        raise CcSwitchConfigError(_CODEX_API_KEY_ERROR)
-
-    provider_id = parsed.get("model_provider")
-    providers = parsed.get("model_providers")
-    provider_config = (
-        providers.get(provider_id)
-        if isinstance(provider_id, str) and isinstance(providers, dict)
-        else None
-    )
-    if (
-        not isinstance(provider_id, str)
-        or not provider_id.strip()
-        or not isinstance(provider_config, dict)
-        or provider_config.get("requires_openai_auth") is not True
-        or "env_key" in provider_config
-    ):
-        raise CcSwitchConfigError(_CODEX_API_KEY_ERROR)
-
-    expected = deepcopy(parsed)
-    expected_provider = expected["model_providers"][provider_id]
-    expected_provider["requires_openai_auth"] = False
-    expected_provider["env_key"] = "OPENAI_API_KEY"
-
-    transformed: list[str] = []
-    assert isinstance(config, str)
-    for match in _CODEX_OPENAI_AUTH_ASSIGNMENT.finditer(config):
-        replacement = (
-            f'{match.group("indent")}requires_openai_auth = false'
-            f'{match.group("comment")}\n'
-            f'{match.group("indent")}env_key = "OPENAI_API_KEY"'
-        )
-        candidate = config[: match.start()] + replacement + config[match.end() :]
-        if _parse_codex_toml(candidate) == expected:
-            transformed.append(candidate)
-
-    if len(transformed) != 1:
-        raise CcSwitchConfigError(_CODEX_API_KEY_ERROR)
-
-    return {"OPENAI_API_KEY": auth["OPENAI_API_KEY"]}, transformed[0]
-
-
-def _codex_home(environment: dict[str, str]) -> Path:
-    configured_home = environment.get("CODEX_HOME")
-    inspection_failed = False
-    is_directory = False
-    home: Path | None = None
-    try:
-        if configured_home is None:
-            home = Path.home() / ".codex"
-        elif configured_home:
-            home = Path(configured_home).expanduser()
-        if home is not None:
-            is_directory = home.is_dir()
-    except (OSError, RuntimeError):
-        inspection_failed = True
-
-    if inspection_failed or not is_directory or home is None:
-        raise CcSwitchConfigError(
-            "CODEX_HOME must refer to an existing directory"
-        )
-
-    environment["CODEX_HOME"] = str(home)
-    return home
-
-
-def _cleanup_codex_profile(profile_path: Path) -> bool:
-    try:
-        profile_path.unlink()
-    except FileNotFoundError:
-        return True
-    except BaseException:
-        return False
-    return True
-
-
-def _prepare_codex_profile(
-    provider: SelectedProvider,
-) -> tuple[Path, CodexProfileRuntime]:
-    profile_path: Path | None = None
-    runtime: CodexProfileRuntime | None = None
-    setup_error: BaseException | None = None
-
-    try:
-        if provider.app_type != "codex":
-            raise CcSwitchConfigError(
-                "Codex profile runtime requires a codex provider"
-            )
-
-        auth_environment, profile_config = _codex_api_key_profile(
-            provider.settings.get("config"), provider.settings.get("auth")
-        )
-        environment = os.environ.copy()
-        home = _codex_home(environment)
-        profile_name = f"cc-switch-{uuid4().hex}"
-        profile_path = home / f"{profile_name}.config.toml"
-        _write_private_file(profile_path, profile_config)
-
-        environment.update(auth_environment)
-        environment.setdefault("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "codex-tui")
-        runtime = CodexProfileRuntime(
-            provider_id=provider.provider_id,
-            provider_name=provider.name,
-            profile_name=profile_name,
-            environment=environment,
-        )
-    except BaseException as exc:
-        setup_error = exc
-
-    if setup_error is not None:
-        if profile_path is not None:
-            _cleanup_codex_profile(profile_path)
-        if isinstance(setup_error, (KeyboardInterrupt, SystemExit)):
-            raise setup_error
-        if isinstance(setup_error, CcSwitchConfigError):
-            raise setup_error
-        raise CcSwitchConfigError(
-            "failed to materialize selected Codex profile"
-        )
-
-    assert profile_path is not None
-    assert runtime is not None
-    return profile_path, runtime
-
-
-@contextmanager
-def materialize_codex_profile(
-    provider: SelectedProvider,
-) -> Iterator[CodexProfileRuntime]:
-    """Overlay one Codex provider without replacing the shared Codex home."""
-    profile_path, runtime = _prepare_codex_profile(provider)
-    body_failed = False
-    try:
-        yield runtime
-    except BaseException:
-        body_failed = True
-        raise
-    finally:
-        cleanup_succeeded = _cleanup_codex_profile(profile_path)
-        if not body_failed and not cleanup_succeeded:
-            raise CcSwitchConfigError(
-                "failed to clean up selected Codex profile"
-            )
-
-
 _CLAUDE_PROFILE_ERROR = (
     "Claude TUI launcher supports only CC Switch proxy profiles with "
     "ANTHROPIC_BASE_URL and exactly one API credential"
@@ -775,23 +588,6 @@ def use_provider(
     provider = load_provider(app_type, selector, db_path)
     with _sigterm_as_system_exit():
         with materialize_provider(provider) as runtime:
-            yield runtime
-
-
-@contextmanager
-def use_codex_profile(
-    selector: str,
-    db_path: str | Path = DEFAULT_DB_PATH,
-) -> Iterator[CodexProfileRuntime]:
-    """Select one Codex provider while preserving shared Codex state."""
-    if os.name == "nt":
-        raise CcSwitchConfigError(
-            "--cc-switch-config is currently supported only on macOS/Linux"
-        )
-
-    provider = load_provider("codex", selector, db_path)
-    with _sigterm_as_system_exit():
-        with materialize_codex_profile(provider) as runtime:
             yield runtime
 
 
