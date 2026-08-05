@@ -18,6 +18,16 @@ from codex_runtime import use_codex_runtime
 PLUGIN_ID = "demo@test-marketplace"
 PROVIDER_ID = "provider-integration-id"
 OTHER_PROVIDER_ID = "other-provider-integration-id"
+DEFAULT_PLUGIN_IDS = {
+    "superpowers@openai-api-curated",
+    "documents@openai-primary-runtime",
+    "pdf@openai-primary-runtime",
+    "presentations@openai-primary-runtime",
+    "template-creator@openai-primary-runtime",
+    "spreadsheets@openai-primary-runtime",
+    "visualize@openai-bundled",
+    "browser@openai-bundled",
+}
 
 
 class CodexPluginCliIntegrationTests(unittest.TestCase):
@@ -250,6 +260,24 @@ source = {json.dumps(str(self.marketplace))}
                     ),
                 )
 
+    def _install_cached_plugin(self, plugin_id):
+        plugin, marketplace = plugin_id.rsplit("@", 1)
+        manifest = (
+            self.shared_home
+            / "plugins"
+            / "cache"
+            / marketplace
+            / plugin
+            / "1.0.0"
+            / ".codex-plugin"
+            / "plugin.json"
+        )
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text(
+            json.dumps({"name": plugin, "version": "1.0.0"}) + "\n",
+            encoding="utf-8",
+        )
+
     def _database_rows(self):
         with closing(sqlite3.connect(self.database)) as connection:
             return (
@@ -409,6 +437,61 @@ source = {json.dumps(str(self.marketplace))}
             / f"{hashlib.sha256(PROVIDER_ID.encode()).hexdigest()}.json"
         )
         self.assertFalse(sidecar.exists())
+        self.assertEqual(self.database.read_bytes(), database_bytes)
+        self.assertEqual(self._database_rows(), database_rows)
+
+    def test_installed_project_defaults_are_enabled_without_database_writes(self):
+        if self.codex is None:
+            self.skipTest("Codex CLI executable is unavailable")
+        probe_environment = os.environ.copy()
+        probe_environment["CODEX_HOME"] = str(self.shared_home)
+        probe = subprocess.run(
+            [self.codex, "plugin", "--help"],
+            env=probe_environment,
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        if probe.returncode != 0:
+            self.skipTest("installed Codex CLI does not support plugins")
+
+        for plugin_id in DEFAULT_PLUGIN_IDS:
+            self._install_cached_plugin(plugin_id)
+
+        database_bytes = self.database.read_bytes()
+        database_rows = self._database_rows()
+        environment = {
+            "CODEX_HOME": str(self.shared_home),
+            "CODEX_SQLITE_HOME": str(self.sqlite_home),
+        }
+
+        with mock.patch.dict(os.environ, environment, clear=False):
+            with use_codex_runtime(
+                "integration-provider", db_path=self.database
+            ) as runtime:
+                config = tomllib.loads(runtime.config_path.read_text())
+                self.assertEqual(
+                    {
+                        plugin_id
+                        for plugin_id, entry in config["plugins"].items()
+                        if entry["enabled"]
+                    },
+                    DEFAULT_PLUGIN_IDS,
+                )
+                installed = self._plugin_command(
+                    runtime,
+                    "list",
+                    "--marketplace",
+                    "openai-api-curated",
+                    "--json",
+                )
+                self.assertTrue(
+                    self._serialized_json_contains(
+                        installed, "superpowers", "installed"
+                    ),
+                    installed,
+                )
+
         self.assertEqual(self.database.read_bytes(), database_bytes)
         self.assertEqual(self._database_rows(), database_rows)
 
