@@ -101,6 +101,26 @@ class ParserTests(unittest.TestCase):
 
             self.assertEqual(raised.exception.code, 2)
 
+    def test_explicit_resume_and_fork_session_ids_are_detected(self):
+        session_id = "01a00aaa-bae9-7541-b690-c6c6d193fe68"
+
+        self.assertEqual(
+            codex_tui._explicit_session_id(["resume", session_id]),
+            session_id,
+        )
+        self.assertEqual(
+            codex_tui._explicit_session_id(
+                ["--model", "gpt-5.6-sol", "fork", session_id]
+            ),
+            session_id,
+        )
+        self.assertIsNone(
+            codex_tui._explicit_session_id(["resume", "session-name"])
+        )
+        self.assertTrue(codex_tui._has_session_picker(["resume"]))
+        self.assertTrue(codex_tui._has_session_picker(["fork", "name"]))
+        self.assertFalse(codex_tui._has_session_picker(["--model", "gpt-5.6-sol"]))
+
 
 class MainTests(unittest.TestCase):
     def setUp(self):
@@ -113,6 +133,8 @@ class MainTests(unittest.TestCase):
             provider_name="jianzhile",
             environment=self.environment,
             warnings=("configured plugin 'missing@test' is not installed",),
+            activate_thread_rollout=mock.Mock(),
+            activate_provider_rollouts=mock.Mock(),
         )
 
     def runtime_context(self):
@@ -192,6 +214,35 @@ class MainTests(unittest.TestCase):
         )
         popen.assert_called_once_with(
             ["/bin/codex", "resume"], env=self.environment
+        )
+        self.runtime.activate_provider_rollouts.assert_called_once_with()
+
+    def test_explicit_session_is_activated_before_launch(self):
+        manager = self.runtime_context()
+        process = self.process()
+        session_id = "01a00aaa-bae9-7541-b690-c6c6d193fe68"
+
+        with mock.patch.object(
+            codex_tui.shutil, "which", return_value="/bin/codex"
+        ), mock.patch.object(
+            codex_tui, "use_codex_runtime", return_value=manager
+        ), mock.patch.object(
+            codex_tui.subprocess, "Popen", return_value=process
+        ) as popen, contextlib.redirect_stderr(io.StringIO()):
+            result = codex_tui.main(
+                [
+                    "--cc-switch-config",
+                    "fengwind",
+                    "--",
+                    "fork",
+                    session_id,
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        self.runtime.activate_thread_rollout.assert_called_once_with(session_id)
+        popen.assert_called_once_with(
+            ["/bin/codex", "fork", session_id], env=self.environment
         )
 
     def test_launches_codex_without_extra_arguments(self):

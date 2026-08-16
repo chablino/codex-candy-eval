@@ -6,6 +6,7 @@ import argparse
 import shutil
 import subprocess
 import sys
+import uuid
 from collections.abc import Sequence
 
 from cc_switch_config import CcSwitchConfigError
@@ -68,6 +69,22 @@ def _wait_for_child(process: subprocess.Popen) -> int:
         raise
 
 
+def _explicit_session_id(arguments: Sequence[str]) -> str | None:
+    for index, argument in enumerate(arguments[:-1]):
+        if argument not in {"resume", "fork"}:
+            continue
+        candidate = arguments[index + 1]
+        try:
+            return str(uuid.UUID(candidate))
+        except (ValueError, AttributeError):
+            continue
+    return None
+
+
+def _has_session_picker(arguments: Sequence[str]) -> bool:
+    return any(argument in {"resume", "fork"} for argument in arguments)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = parse_args(argv)
     executable = shutil.which("codex")
@@ -82,6 +99,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         ) as runtime:
             for warning in runtime.warnings:
                 print(f"WARNING: {warning}", file=sys.stderr)
+            session_id = _explicit_session_id(arguments.codex_args)
+            if session_id is not None:
+                runtime.activate_thread_rollout(session_id)
+            elif _has_session_picker(arguments.codex_args):
+                runtime.activate_provider_rollouts()
             process = subprocess.Popen(
                 [executable, *arguments.codex_args],
                 env=runtime.environment,

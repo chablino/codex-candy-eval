@@ -3,10 +3,12 @@ import json
 import os
 import shutil
 import signal
+import sqlite3
 import stat
 import tempfile
 import tomllib
 import unittest
+from contextlib import closing
 from copy import deepcopy
 from pathlib import Path
 from unittest import mock
@@ -23,6 +25,7 @@ from codex_plugin_state import (
 from codex_runtime import (
     DIRECTORY_SHARE_ALLOWLIST,
     FILE_SHARE_ALLOWLIST,
+    _MATERIALIZED_DIRECTORY_ALLOWLIST,
     CodexRuntime,
     materialize_codex_runtime,
 )
@@ -227,6 +230,35 @@ class CodexRuntimeMaterializationTests(unittest.TestCase):
             / f"{digest}.json"
         )
 
+    def create_state_database(self):
+        path = self.shared_sqlite_home / "state_5.sqlite"
+        with closing(sqlite3.connect(path)) as connection, connection:
+            connection.execute(
+                """
+                CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    rollout_path TEXT NOT NULL,
+                    model_provider TEXT NOT NULL DEFAULT 'custom'
+                )
+                """
+            )
+        return path
+
+    def write_rollout(self, relative_path, thread_id):
+        path = self.shared_home / "sessions" / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {"id": thread_id, "session_id": thread_id},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return path
+
     def test_complete_runtime_is_isolated_and_shares_only_allowlist(self):
         shared_config = self.shared_home / "config.toml"
         shared_auth = self.shared_home / "auth.json"
@@ -285,9 +317,20 @@ enabled = true
                 for name in DIRECTORY_SHARE_ALLOWLIST:
                     link = runtime_home / name
                     target = self.shared_home / name
-                    self.assertTrue(link.is_symlink(), name)
-                    self.assertEqual(link.resolve(), target.resolve())
                     self.assertTrue(target.is_dir())
+                    if name in _MATERIALIZED_DIRECTORY_ALLOWLIST:
+                        self.assertTrue(link.is_dir(), name)
+                        self.assertFalse(link.is_symlink(), name)
+                        for source in target.rglob("*"):
+                            if source.is_file():
+                                relative = source.relative_to(target)
+                                self.assertTrue(
+                                    os.path.samefile(link / relative, source),
+                                    str(relative),
+                                )
+                    else:
+                        self.assertTrue(link.is_symlink(), name)
+                        self.assertEqual(link.resolve(), target.resolve())
                 for name in FILE_SHARE_ALLOWLIST:
                     link = runtime_home / name
                     target = self.shared_home / name
@@ -330,6 +373,206 @@ enabled = true
         self.assertEqual(shared_config.read_text(), shared_config_text)
         self.assertEqual(shared_auth.read_text(), '{"token":"app-secret"}\n')
         self.assertEqual(session.read_text(), "shared-session\n")
+
+    def test_historical_launcher_rollout_paths_are_repaired_before_launch(self):
+        thread_id = "01a00000-0000-7000-8000-000000000001"
+        relative = (
+            Path("2026/08/16")
+            / f"rollout-2026-08-16T12-00-00-{thread_id}.jsonl"
+        )
+        rollout = self.write_rollout(relative, thread_id)
+        database = self.create_state_database()
+        stale_path = (
+            Path("/private/tmp")
+            / "codex-candy-eval-codex-expired"
+            / "sessions"
+            / relative
+        )
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute(
+                "INSERT INTO threads (id, rollout_path) VALUES (?, ?)",
+                (thread_id, str(stale_path)),
+            )
+
+        with mock.patch.dict(os.environ, self.environment(), clear=True):
+            with materialize_codex_runtime(self.provider, None):
+                with closing(sqlite3.connect(database)) as connection:
+                    repaired = connection.execute(
+                        "SELECT rollout_path FROM threads WHERE id = ?",
+                        (thread_id,),
+                    ).fetchone()[0]
+
+        self.assertEqual(repaired, str(rollout.resolve()))
+
+    def test_persisted_rollout_is_mapped_inside_active_runtime(self):
+        thread_id = "01a00000-0000-7000-8000-000000000010"
+        relative = (
+            Path("2026/08/16")
+            / f"rollout-2026-08-16T12-00-30-{thread_id}.jsonl"
+        )
+        rollout = self.write_rollout(relative, thread_id)
+        database = self.create_state_database()
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute(
+                "INSERT INTO threads (id, rollout_path) VALUES (?, ?)",
+                (thread_id, str(rollout.resolve())),
+            )
+
+        with mock.patch.dict(os.environ, self.environment(), clear=True):
+            with materialize_codex_runtime(self.provider, None) as runtime:
+                runtime_rollout = runtime.home / "sessions" / relative
+                self.assertFalse((runtime.home / "sessions").is_symlink())
+                self.assertTrue(os.path.samefile(runtime_rollout, rollout))
+                self.assertTrue(runtime.activate_thread_rollout(thread_id))
+                with closing(sqlite3.connect(database)) as connection:
+                    active_path = connection.execute(
+                        "SELECT rollout_path FROM threads WHERE id = ?",
+                        (thread_id,),
+                    ).fetchone()[0]
+                self.assertEqual(active_path, str(runtime_rollout.resolve()))
+
+        with closing(sqlite3.connect(database)) as connection:
+            restored_path = connection.execute(
+                "SELECT rollout_path FROM threads WHERE id = ?",
+                (thread_id,),
+            ).fetchone()[0]
+        self.assertEqual(restored_path, str(rollout.resolve()))
+
+    def test_picker_maps_only_current_model_provider(self):
+        custom_id = "01a00000-0000-7000-8000-000000000011"
+        hlool_id = "01a00000-0000-7000-8000-000000000012"
+        custom_relative = (
+            Path("2026/08/16")
+            / f"rollout-2026-08-16T12-00-31-{custom_id}.jsonl"
+        )
+        hlool_relative = (
+            Path("2026/08/16")
+            / f"rollout-2026-08-16T12-00-32-{hlool_id}.jsonl"
+        )
+        custom_rollout = self.write_rollout(custom_relative, custom_id)
+        hlool_rollout = self.write_rollout(hlool_relative, hlool_id)
+        database = self.create_state_database()
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.executemany(
+                """
+                INSERT INTO threads (id, rollout_path, model_provider)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    (custom_id, str(custom_rollout.resolve()), "custom"),
+                    (hlool_id, str(hlool_rollout.resolve()), "hlool"),
+                ),
+            )
+
+        with mock.patch.dict(os.environ, self.environment(), clear=True):
+            with materialize_codex_runtime(self.provider, None) as runtime:
+                self.assertEqual(runtime.activate_provider_rollouts(), 1)
+                with closing(sqlite3.connect(database)) as connection:
+                    paths = dict(
+                        connection.execute(
+                            "SELECT id, rollout_path FROM threads"
+                        ).fetchall()
+                    )
+                self.assertEqual(
+                    paths[custom_id],
+                    str((runtime.home / "sessions" / custom_relative).resolve()),
+                )
+                self.assertEqual(paths[hlool_id], str(hlool_rollout.resolve()))
+
+        with closing(sqlite3.connect(database)) as connection:
+            restored_paths = dict(
+                connection.execute(
+                    "SELECT id, rollout_path FROM threads"
+                ).fetchall()
+            )
+        self.assertEqual(restored_paths[custom_id], str(custom_rollout.resolve()))
+        self.assertEqual(restored_paths[hlool_id], str(hlool_rollout.resolve()))
+
+    def test_new_launcher_rollout_path_is_repaired_before_temp_cleanup(self):
+        thread_id = "01a00000-0000-7000-8000-000000000002"
+        relative = (
+            Path("2026/08/16")
+            / f"rollout-2026-08-16T12-01-00-{thread_id}.jsonl"
+        )
+        database = self.create_state_database()
+
+        with mock.patch.dict(os.environ, self.environment(), clear=True):
+            with materialize_codex_runtime(self.provider, None) as runtime:
+                runtime_home = runtime.home
+                rollout = runtime.home / "sessions" / relative
+                rollout.parent.mkdir(parents=True, exist_ok=True)
+                rollout.write_text(
+                    json.dumps(
+                        {
+                            "type": "session_meta",
+                            "payload": {
+                                "id": thread_id,
+                                "session_id": thread_id,
+                            },
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                temporary_path = runtime.home / "sessions" / relative
+                self.assertEqual(temporary_path, rollout)
+                with closing(sqlite3.connect(database)) as connection, connection:
+                    connection.execute(
+                        "INSERT INTO threads (id, rollout_path) VALUES (?, ?)",
+                        (thread_id, str(temporary_path)),
+                    )
+
+        self.assertFalse(runtime_home.exists())
+        with closing(sqlite3.connect(database)) as connection:
+            repaired = connection.execute(
+                "SELECT rollout_path FROM threads WHERE id = ?",
+                (thread_id,),
+            ).fetchone()[0]
+        shared_rollout = self.shared_home / "sessions" / relative
+        self.assertTrue(shared_rollout.is_file())
+        self.assertEqual(repaired, str(shared_rollout.resolve()))
+
+    def test_rollout_repair_ignores_unverified_or_unowned_rows(self):
+        valid_id = "01a00000-0000-7000-8000-000000000003"
+        wrong_id = "01a00000-0000-7000-8000-000000000004"
+        relative = (
+            Path("2026/08/16")
+            / f"rollout-2026-08-16T12-02-00-{valid_id}.jsonl"
+        )
+        self.write_rollout(relative, valid_id)
+        database = self.create_state_database()
+        rows = (
+            (
+                valid_id,
+                str(Path("/private/tmp/other-launcher/sessions") / relative),
+            ),
+            (
+                wrong_id,
+                str(
+                    Path("/private/tmp/codex-candy-eval-codex-expired/sessions")
+                    / relative
+                ),
+            ),
+        )
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.executemany(
+                "INSERT INTO threads (id, rollout_path) VALUES (?, ?)",
+                rows,
+            )
+
+        repaired = codex_runtime._repair_launcher_rollout_paths(
+            self.shared_sqlite_home,
+            self.shared_home,
+        )
+
+        self.assertEqual(repaired, 0)
+        with closing(sqlite3.connect(database)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT id, rollout_path FROM threads ORDER BY id"
+                ).fetchall(),
+                list(rows),
+            )
 
     def test_common_config_merges_structurally_when_supplied(self):
         plugin_id = self.install_plugin()
@@ -675,6 +918,27 @@ requires_openai_auth = true
                     str(default_home.resolve()),
                 )
                 self.assertNotEqual(runtime.home, default_home)
+
+    def test_provider_sqlite_home_cannot_override_shared_state(self):
+        provider = SelectedProvider(
+            "provider-id",
+            "codex",
+            "fengwind",
+            {
+                "config": f'sqlite_home = "/private/provider-state"\n{PROVIDER_CONFIG}',
+                "auth": {"OPENAI_API_KEY": "provider-secret"},
+            },
+        )
+
+        with mock.patch.dict(os.environ, self.environment(), clear=True):
+            with materialize_codex_runtime(provider, None) as runtime:
+                config = tomllib.loads(runtime.config_path.read_text())
+
+                self.assertNotIn("sqlite_home", config)
+                self.assertEqual(
+                    runtime.environment["CODEX_SQLITE_HOME"],
+                    str(self.shared_sqlite_home.resolve()),
+                )
 
     def test_allowlist_type_mismatches_fail_and_unknown_paths_stay_isolated(self):
         cases = (

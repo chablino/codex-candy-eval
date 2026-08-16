@@ -66,8 +66,32 @@ home 中权限为 `0600` 的 `auth.json`；临时 `config.toml` 只保存环境�
 目录及其中的认证文件。
 
 不同 provider 仍共享 sessions、SQLite 状态、history、skills、rules、memories 和插件目录，
-所以可以跨 provider 使用 `resume`。每个并发窗口都有独立临时配置；插件开关在退出时按实际
-变化加锁合并，不会因为另一个较早启动的窗口退出而整份覆盖。
+所以可以按 session ID 跨 provider 使用 `resume`。每个并发窗口都有独立临时配置；插件开关
+在退出时按实际变化加锁合并，不会因为另一个较早启动的窗口退出而整份覆盖。
+
+Codex 0.147.0 起，SQLite thread 索引会保存 rollout JSONL 的绝对路径。启动器仍使用临时
+`CODEX_HOME` 隔离配置。`sessions` 和 `archived_sessions` 会在临时 home 中使用真实目录，
+已有文件以硬链接复用；这样活动 TUI 的 `/fork` 看到的 rollout 路径仍位于当前 Codex home，
+不会触发新版 app-server 的路径校验。启动 `resume`/`fork` picker 前，启动器还会把当前
+`model_provider` 的历史 rollout 映射到本次临时 home；直接传 session ID 时只映射该记录。
+退出时新文件同步回共享目录，并把仅由本启动器产生的临时 rollout 路径校验并改回共享
+`CODEX_HOME/sessions/...`。因此升级前已经留下、且共享 JSONL 仍存在的失效记录会在下次
+启动时自动修复，新会话也不会在临时目录删除后变成只能看到但无法 fork 的记录。provider 或
+Common Config 中的 `sqlite_home` 不会覆盖启动器选定的共享 SQLite 目录。
+
+新版 Codex 的默认 `resume`/`fork` picker 还会按当前 `model_provider` 展示会话；`--all` 只取消
+当前工作目录过滤。比如 `hlool` 的 provider ID 是 `hlool`，而 `muyuan` 的 provider ID 是
+`custom`，即使两者使用同一个文件夹和同一份 SQLite，picker 内容也可能明显不同。这不代表
+sessions 被隔离。跨 provider 继续或分叉已知会话时，请直接传 session ID：
+
+```bash
+python3 codex_tui.py --cc-switch-config muyuan -- resume SESSION_ID
+python3 codex_tui.py --cc-switch-config muyuan -- fork SESSION_ID
+```
+
+刚启动且尚未提交过任何一轮消息的空白 TUI 还没有持久化 rollout；此时分叉没有历史可复制，
+Codex 0.147.0 可能提示 `no rollout found`。先提交至少一轮消息再 `/fork`，或者直接再启动一个
+空白窗口即可；这与上述旧临时路径迁移是两个不同情况。
 
 插件的安装和删除是全局的，启用和关闭是按 provider 保存的：
 
