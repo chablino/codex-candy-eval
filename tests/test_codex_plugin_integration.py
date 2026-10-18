@@ -11,6 +11,8 @@ from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
+import tomli_w
+
 from codex_plugin_state import PluginStateStore, scan_plugin_inventory
 from codex_runtime import use_codex_runtime
 
@@ -27,6 +29,13 @@ DEFAULT_PLUGIN_IDS = {
     "spreadsheets@openai-primary-runtime",
     "visualize@openai-bundled",
     "browser@openai-bundled",
+}
+PROJECT_DEFAULT_PLUGIN_IDS = {
+    "documents@openai-primary-runtime",
+    "pdf@openai-primary-runtime",
+    "presentations@openai-primary-runtime",
+    "spreadsheets@openai-primary-runtime",
+    "template-creator@openai-primary-runtime",
 }
 
 
@@ -440,7 +449,77 @@ source = {json.dumps(str(self.marketplace))}
         self.assertEqual(self.database.read_bytes(), database_bytes)
         self.assertEqual(self._database_rows(), database_rows)
 
-    def test_installed_project_defaults_are_enabled_without_database_writes(self):
+    def test_uninstall_keeps_enabled_baseline_off_after_restart_and_reinstall(self):
+        if self.codex is None:
+            self.skipTest("Codex CLI executable is unavailable")
+
+        environment = {
+            "CODEX_HOME": str(self.shared_home),
+            "CODEX_SQLITE_HOME": str(self.sqlite_home),
+        }
+        state = PluginStateStore(self.shared_home)
+        defaults = self.root / "plugin-defaults.toml"
+
+        for baseline_source in ("provider", "project-defaults"):
+            with self.subTest(baseline_source=baseline_source):
+                defaults.write_text(
+                    f'[plugins."{PLUGIN_ID}"]\nenabled = true\n'
+                    if baseline_source == "project-defaults"
+                    else "[plugins]\n",
+                    encoding="utf-8",
+                )
+                with closing(sqlite3.connect(self.database)) as connection, connection:
+                    raw = connection.execute(
+                        "SELECT settings_config FROM providers WHERE id = ?",
+                        (PROVIDER_ID,),
+                    ).fetchone()[0]
+                    settings = json.loads(raw)
+                    document = tomllib.loads(settings["config"])
+                    if baseline_source == "provider":
+                        document["plugins"] = {PLUGIN_ID: {"enabled": True}}
+                    else:
+                        document.pop("plugins", None)
+                    settings["config"] = tomli_w.dumps(document)
+                    connection.execute(
+                        "UPDATE providers SET settings_config = ? WHERE id = ?",
+                        (json.dumps(settings), PROVIDER_ID),
+                    )
+
+                state.reset_provider(PROVIDER_ID)
+                database_rows = self._database_rows()
+                with mock.patch.dict(os.environ, environment), mock.patch(
+                    "codex_runtime._DEFAULT_PLUGIN_CONFIG_PATH", defaults
+                ):
+                    with use_codex_runtime(PROVIDER_ID, db_path=self.database) as runtime:
+                        self._plugin_command(runtime, "add", PLUGIN_ID, "--json")
+                    with use_codex_runtime(PROVIDER_ID, db_path=self.database) as runtime:
+                        self._plugin_command(runtime, "remove", PLUGIN_ID, "--json")
+                        config = tomllib.loads(runtime.config_path.read_text())
+                        self.assertNotIn(
+                            PLUGIN_ID, config.get("plugins", {})
+                        )
+
+                    self.assertEqual(
+                        state.load_provider_plugins(PROVIDER_ID), {PLUGIN_ID: False}
+                    )
+                    with use_codex_runtime(PROVIDER_ID, db_path=self.database) as runtime:
+                        config = tomllib.loads(runtime.config_path.read_text())
+                        self.assertFalse(
+                            config["plugins"][PLUGIN_ID]["enabled"]
+                        )
+                        self.assertEqual(runtime.warnings, ())
+
+                    with use_codex_runtime(OTHER_PROVIDER_ID, db_path=self.database) as runtime:
+                        self._plugin_command(runtime, "add", PLUGIN_ID, "--json")
+                    with use_codex_runtime(PROVIDER_ID, db_path=self.database) as runtime:
+                        config = tomllib.loads(runtime.config_path.read_text())
+                        self.assertFalse(
+                            config["plugins"][PLUGIN_ID]["enabled"]
+                        )
+
+                self.assertEqual(self._database_rows(), database_rows)
+
+    def test_installed_plugins_follow_project_defaults_without_database_writes(self):
         if self.codex is None:
             self.skipTest("Codex CLI executable is unavailable")
         probe_environment = os.environ.copy()
@@ -473,10 +552,10 @@ source = {json.dumps(str(self.marketplace))}
                 self.assertEqual(
                     {
                         plugin_id
-                        for plugin_id, entry in config["plugins"].items()
+                        for plugin_id, entry in config.get("plugins", {}).items()
                         if entry["enabled"]
                     },
-                    DEFAULT_PLUGIN_IDS,
+                    PROJECT_DEFAULT_PLUGIN_IDS,
                 )
                 installed = self._plugin_command(
                     runtime,
@@ -494,6 +573,70 @@ source = {json.dumps(str(self.marketplace))}
 
         self.assertEqual(self.database.read_bytes(), database_bytes)
         self.assertEqual(self._database_rows(), database_rows)
+
+    def test_local_skill_exclusion_and_plugin_toggle_survive_restart(self):
+        if self.codex is None:
+            self.skipTest("Codex CLI executable is unavailable")
+        probe = subprocess.run(
+            [self.codex, "debug", "prompt-input", "--help"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        if probe.returncode != 0:
+            self.skipTest("installed Codex CLI does not support prompt-input inspection")
+        standalone = self.root / ".agents" / "skills" / "demo" / "SKILL.md"
+        standalone.parent.mkdir(parents=True)
+        standalone.write_text(
+            "---\nname: demo\ndescription: Standalone skill exclusion fixture.\n"
+            "---\n\nStandalone fixture.\n",
+            encoding="utf-8",
+        )
+
+        def prompt_input(runtime):
+            result = subprocess.run(
+                [self.codex, "debug", "prompt-input"],
+                cwd=self.root,
+                env=runtime.environment,
+                text=True,
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.dumps(json.loads(result.stdout))
+
+        environment = {
+            "CODEX_HOME": str(self.shared_home),
+            "CODEX_SQLITE_HOME": str(self.sqlite_home),
+        }
+        with mock.patch.dict(os.environ, environment):
+            with use_codex_runtime(PROVIDER_ID, db_path=self.database) as runtime:
+                self.assertIn("Standalone skill exclusion fixture", prompt_input(runtime))
+
+            policy = self.shared_home / ".cc-switch-tui" / "local-skills.toml"
+            policy.write_text(tomli_w.dumps({
+                "disabled_skills": [str(standalone)],
+                "skip_hyperframes_auto_install": True,
+            }), encoding="utf-8")
+            with use_codex_runtime(PROVIDER_ID, db_path=self.database) as runtime:
+                self._plugin_command(runtime, "add", PLUGIN_ID, "--json")
+                prompt = prompt_input(runtime)
+                self.assertNotIn("Standalone skill exclusion fixture", prompt)
+                self.assertIn("demo:demo", prompt)
+
+            with use_codex_runtime(PROVIDER_ID, db_path=self.database) as runtime:
+                config = tomllib.loads(runtime.config_path.read_text())
+                config["plugins"][PLUGIN_ID]["enabled"] = False
+                runtime.config_path.write_text(tomli_w.dumps(config), encoding="utf-8")
+                prompt = prompt_input(runtime)
+                self.assertNotIn("Standalone skill exclusion fixture", prompt)
+                self.assertNotIn("demo:demo", prompt)
+
+            with use_codex_runtime(PROVIDER_ID, db_path=self.database) as runtime:
+                prompt = prompt_input(runtime)
+                self.assertNotIn("Standalone skill exclusion fixture", prompt)
+                self.assertNotIn("demo:demo", prompt)
+                self.assertTrue(standalone.exists())
 
 
 if __name__ == "__main__":

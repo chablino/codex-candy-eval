@@ -1,5 +1,6 @@
 import contextlib
 import io
+from pathlib import Path
 import subprocess
 import unittest
 from types import SimpleNamespace
@@ -81,6 +82,16 @@ class ParserTests(unittest.TestCase):
                 "gpt-5.6-sol",
             ],
         )
+
+    def test_mcp_editor_flag_is_not_forwarded_and_rejects_other_actions(self):
+        arguments = codex_tui.parse_args(["--cc-switch-config", "lanln", "--edit-mcp"])
+        self.assertTrue(arguments.edit_mcp)
+        self.assertEqual(arguments.codex_args, [])
+        for extra in (["--", "mcp", "add", "dbx"], ["--reset-plugin-state"]):
+            with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    codex_tui.parse_args(["--cc-switch-config", "lanln", "--edit-mcp", *extra])
+                self.assertEqual(raised.exception.code, 2)
 
     def test_forwarded_profile_forms_are_rejected(self):
         cases = (
@@ -216,6 +227,112 @@ class MainTests(unittest.TestCase):
             ["/bin/codex", "resume"], env=self.environment
         )
         self.runtime.activate_provider_rollouts.assert_called_once_with()
+
+    def test_native_mcp_edits_save_only_after_success_without_tui_runtime(self):
+        for native_code in (0, 2):
+            with self.subTest(native_code=native_code):
+                editor = SimpleNamespace(
+                    environment={"CODEX_HOME": "/private/tmp/mcp-only"},
+                    provider=SimpleNamespace(name="jianzhile"),
+                    save=mock.Mock(return_value="/test/backup.json"),
+                )
+                manager = mock.MagicMock()
+                manager.__enter__.return_value = editor
+                manager.__exit__.return_value = False
+                forwarded = ["mcp", "add", "dbx", "--", "/test/dbx-mcp"]
+                stdout = io.StringIO()
+                with mock.patch.object(
+                    codex_tui.shutil, "which", return_value="/bin/codex"
+                ), mock.patch.object(
+                    codex_tui, "edit_provider_mcp", return_value=manager
+                ) as edit, mock.patch.object(
+                    codex_tui, "use_codex_runtime"
+                ) as use_runtime, mock.patch.object(
+                    codex_tui.subprocess, "Popen", return_value=self.process(native_code)
+                ) as popen, contextlib.redirect_stdout(stdout):
+                    result = codex_tui.main([
+                        "--cc-switch-config", "jianzhile", "--", *forwarded
+                    ])
+                self.assertEqual(result, native_code)
+                edit.assert_called_once_with("jianzhile")
+                use_runtime.assert_not_called()
+                popen.assert_called_once_with(["/bin/codex", *forwarded], env=editor.environment)
+                if native_code == 0:
+                    editor.save.assert_called_once_with()
+                    self.assertIn("jianzhile", stdout.getvalue())
+                    self.assertIn("backup.json", stdout.getvalue())
+                else:
+                    editor.save.assert_not_called()
+                    self.assertEqual(stdout.getvalue(), "")
+
+    def test_native_mcp_save_failure_returns_error_and_cleans_temporary_home(self):
+        editor = SimpleNamespace(
+            environment={},
+            save=mock.Mock(side_effect=CcSwitchConfigError("concurrent MCP edit")),
+        )
+        manager = mock.MagicMock()
+        manager.__enter__.return_value = editor
+        manager.__exit__.return_value = False
+        stderr = io.StringIO()
+        with mock.patch.object(
+            codex_tui.shutil, "which", return_value="/bin/codex"
+        ), mock.patch.object(
+            codex_tui, "edit_provider_mcp", return_value=manager
+        ), mock.patch.object(
+            codex_tui.subprocess, "Popen", return_value=self.process()
+        ), contextlib.redirect_stderr(stderr):
+            result = codex_tui.main([
+                "--cc-switch-config", "jianzhile", "--", "mcp", "remove", "dbx"
+            ])
+        self.assertEqual(result, 2)
+        self.assertIn("concurrent MCP edit", stderr.getvalue())
+        manager.__exit__.assert_called_once()
+
+    def test_mcp_editor_uses_editor_arguments_and_saves_only_after_success(self):
+        for editor_code in (0, 1):
+            with self.subTest(editor_code=editor_code):
+                editor = SimpleNamespace(
+                    config_path=Path("/private/tmp/mcp-only/config.toml"),
+                    environment={"CODEX_HOME": "/private/tmp/mcp-only"},
+                    provider=SimpleNamespace(name="lanln"),
+                    save=mock.Mock(return_value="/test/backup.json"),
+                )
+                manager = mock.MagicMock()
+                manager.__enter__.return_value = editor
+                manager.__exit__.return_value = False
+                with mock.patch.dict(codex_tui.os.environ, {
+                    "VISUAL": 'test-editor --wait "argument with spaces"',
+                }), mock.patch.object(
+                    codex_tui.shutil, "which"
+                ) as which, mock.patch.object(
+                    codex_tui, "edit_provider_mcp", return_value=manager
+                ) as edit, mock.patch.object(
+                    codex_tui, "use_codex_runtime"
+                ) as use_runtime, mock.patch.object(
+                    codex_tui.subprocess, "Popen", return_value=self.process(editor_code)
+                ) as popen, contextlib.redirect_stdout(io.StringIO()):
+                    result = codex_tui.main(["--cc-switch-config", "lanln", "--edit-mcp"])
+                self.assertEqual(result, editor_code)
+                which.assert_not_called()
+                use_runtime.assert_not_called()
+                edit.assert_called_once_with("lanln", mcp_only=True)
+                popen.assert_called_once_with([
+                    "test-editor", "--wait", "argument with spaces", str(editor.config_path),
+                ], env=editor.environment)
+                if editor_code == 0:
+                    editor.save.assert_called_once_with()
+                else:
+                    editor.save.assert_not_called()
+
+    def test_invalid_editor_setting_stops_before_creating_config(self):
+        stderr = io.StringIO()
+        with mock.patch.dict(codex_tui.os.environ, {"VISUAL": 'invalid-"editor'}), mock.patch.object(
+            codex_tui, "edit_provider_mcp"
+        ) as edit, contextlib.redirect_stderr(stderr):
+            result = codex_tui.main(["--cc-switch-config", "lanln", "--edit-mcp"])
+        self.assertEqual(result, 2)
+        self.assertIn("VISUAL/EDITOR is invalid", stderr.getvalue())
+        edit.assert_not_called()
 
     def test_explicit_session_is_activated_before_launch(self):
         manager = self.runtime_context()

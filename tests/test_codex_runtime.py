@@ -46,14 +46,11 @@ PROVIDER_SETTINGS = {
     "auth": {"OPENAI_API_KEY": "provider-secret"},
 }
 EXPECTED_DEFAULT_PLUGINS = {
-    "superpowers@openai-api-curated",
-    "documents@openai-primary-runtime",
-    "pdf@openai-primary-runtime",
-    "presentations@openai-primary-runtime",
-    "template-creator@openai-primary-runtime",
-    "spreadsheets@openai-primary-runtime",
-    "visualize@openai-bundled",
-    "browser@openai-bundled",
+    "documents@openai-primary-runtime": True,
+    "pdf@openai-primary-runtime": True,
+    "presentations@openai-primary-runtime": True,
+    "spreadsheets@openai-primary-runtime": True,
+    "template-creator@openai-primary-runtime": True,
 }
 
 
@@ -63,11 +60,10 @@ class DefaultPluginConfigTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
 
-    def test_project_defaults_are_the_eight_anyrouter_plugins(self):
+    def test_project_defaults_match_normal_codex_plugins(self):
         defaults = codex_runtime._load_default_plugin_config()
 
-        self.assertEqual(set(defaults), EXPECTED_DEFAULT_PLUGINS)
-        self.assertTrue(all(defaults.values()))
+        self.assertEqual(defaults, EXPECTED_DEFAULT_PLUGINS)
 
     def test_project_defaults_are_loaded_independently_of_working_directory(self):
         previous = Path.cwd()
@@ -77,7 +73,7 @@ class DefaultPluginConfigTests(unittest.TestCase):
         finally:
             os.chdir(previous)
 
-        self.assertEqual(set(defaults), EXPECTED_DEFAULT_PLUGINS)
+        self.assertEqual(defaults, EXPECTED_DEFAULT_PLUGINS)
         self.assertEqual(
             codex_runtime._DEFAULT_PLUGIN_CONFIG_PATH,
             Path(codex_runtime.__file__).with_name("codex_plugin_defaults.toml"),
@@ -404,6 +400,36 @@ enabled = true
 
         self.assertEqual(repaired, str(rollout.resolve()))
 
+    def test_stale_rollout_repairs_when_orphan_runtime_root_survives(self):
+        thread_id = "01a00000-0000-7000-8000-000000000003"
+        relative = (
+            Path("2026/08/16")
+            / f"rollout-2026-08-16T12-00-03-{thread_id}.jsonl"
+        )
+        rollout = self.write_rollout(relative, thread_id)
+        database = self.create_state_database()
+        orphan_home = self.root / "codex-candy-eval-codex-orphan"
+        stale_path = orphan_home / "sessions" / relative
+        orphan_home.mkdir()
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute(
+                "INSERT INTO threads (id, rollout_path) VALUES (?, ?)",
+                (thread_id, str(stale_path)),
+            )
+
+        repaired = codex_runtime._repair_launcher_rollout_paths(
+            self.shared_sqlite_home,
+            self.shared_home,
+        )
+
+        self.assertEqual(repaired, 1)
+        with closing(sqlite3.connect(database)) as connection:
+            indexed_path = connection.execute(
+                "SELECT rollout_path FROM threads WHERE id = ?",
+                (thread_id,),
+            ).fetchone()[0]
+        self.assertEqual(indexed_path, str(rollout.resolve()))
+
     def test_persisted_rollout_is_mapped_inside_active_runtime(self):
         thread_id = "01a00000-0000-7000-8000-000000000010"
         relative = (
@@ -487,6 +513,52 @@ enabled = true
             )
         self.assertEqual(restored_paths[custom_id], str(custom_rollout.resolve()))
         self.assertEqual(restored_paths[hlool_id], str(hlool_rollout.resolve()))
+
+    def test_other_runtime_startup_and_shutdown_preserve_active_rollout(self):
+        thread_id = "01a00000-0000-7000-8000-000000000013"
+        relative = (
+            Path("2026/08/16")
+            / f"rollout-2026-08-16T12-00-33-{thread_id}.jsonl"
+        )
+        rollout = self.write_rollout(relative, thread_id)
+        database = self.create_state_database()
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute(
+                "INSERT INTO threads (id, rollout_path) VALUES (?, ?)",
+                (thread_id, str(rollout.resolve())),
+            )
+
+        def indexed_path():
+            with closing(sqlite3.connect(database)) as connection:
+                return connection.execute(
+                    "SELECT rollout_path FROM threads WHERE id = ?",
+                    (thread_id,),
+                ).fetchone()[0]
+
+        with mock.patch.dict(os.environ, self.environment(), clear=True):
+            with materialize_codex_runtime(self.provider, None) as first:
+                first.activate_thread_rollout(thread_id)
+                active_path = str((first.home / "sessions" / relative).resolve())
+                self.assertEqual(indexed_path(), active_path)
+
+                with materialize_codex_runtime(self.provider, None):
+                    after_startup = indexed_path()
+                    # Simulate the first TUI persisting its active path again.
+                    with closing(sqlite3.connect(database)) as connection, connection:
+                        connection.execute(
+                            "UPDATE threads SET rollout_path = ? WHERE id = ?",
+                            (active_path, thread_id),
+                        )
+                after_shutdown = indexed_path()
+
+                for phase, path in (
+                    ("startup", after_startup),
+                    ("shutdown", after_shutdown),
+                ):
+                    with self.subTest(phase=phase):
+                        self.assertEqual(path, active_path)
+
+        self.assertEqual(indexed_path(), str(rollout.resolve()))
 
     def test_new_launcher_rollout_path_is_repaired_before_temp_cleanup(self):
         thread_id = "01a00000-0000-7000-8000-000000000002"
@@ -574,6 +646,145 @@ enabled = true
                 list(rows),
             )
 
+    def test_segmented_rollout_is_repaired_activated_and_restored(self):
+        thread_id = "01a0e6b4-0823-7832-98fc-e413e48fcf92"
+        segment_id = "01a0e6d4-0825-7c62-869f-58a703f67d46"
+        relative = (
+            Path("2026/09/28")
+            / f"rollout-2026-09-28T15-04-10-{thread_id}_{segment_id}.jsonl"
+        )
+        database = self.create_state_database()
+        for directory in ("sessions", "archived_sessions"):
+            for picker in (False, True):
+                with self.subTest(directory=directory, picker=picker):
+                    rollout = self.write_rollout(relative, thread_id)
+                    if directory != "sessions":
+                        archived = self.shared_home / directory / relative
+                        archived.parent.mkdir(parents=True, exist_ok=True)
+                        rollout = rollout.replace(archived)
+                    stale_path = (
+                        self.root / "codex-candy-eval-codex-expired"
+                        / directory / relative
+                    )
+                    with closing(sqlite3.connect(database)) as connection, connection:
+                        connection.execute(
+                            "INSERT OR REPLACE INTO threads (id, rollout_path) VALUES (?, ?)",
+                            (thread_id, str(stale_path)),
+                        )
+
+                    with mock.patch.dict(os.environ, self.environment(), clear=True):
+                        with materialize_codex_runtime(self.provider, None) as runtime:
+                            with closing(sqlite3.connect(database)) as connection:
+                                repaired = connection.execute(
+                                    "SELECT rollout_path FROM threads WHERE id = ?",
+                                    (thread_id,),
+                                ).fetchone()[0]
+                            self.assertEqual(repaired, str(rollout.resolve()))
+                            if picker:
+                                self.assertEqual(runtime.activate_provider_rollouts(), 1)
+                            else:
+                                self.assertTrue(runtime.activate_thread_rollout(thread_id))
+                            with closing(sqlite3.connect(database)) as connection:
+                                active = connection.execute(
+                                    "SELECT rollout_path FROM threads WHERE id = ?",
+                                    (thread_id,),
+                                ).fetchone()[0]
+                            self.assertEqual(
+                                active, str((runtime.home / directory / relative).resolve())
+                            )
+
+                    with closing(sqlite3.connect(database)) as connection:
+                        restored = connection.execute(
+                            "SELECT rollout_path FROM threads WHERE id = ?",
+                            (thread_id,),
+                        ).fetchone()[0]
+                    self.assertEqual(restored, str(rollout.resolve()))
+
+    def test_new_segmented_rollout_survives_keyboard_interrupt(self):
+        thread_id = "01a0e6b4-0823-7832-98fc-e413e48fcf92"
+        segment_id = "01a0e6d4-0825-7c62-869f-58a703f67d46"
+        relative = (
+            Path("2026/09/28")
+            / f"rollout-2026-09-28T15-04-10-{thread_id}_{segment_id}.jsonl"
+        )
+        database = self.create_state_database()
+        content = json.dumps({"type": "session_meta", "payload": {"id": thread_id}}) + "\n"
+        with mock.patch.dict(os.environ, self.environment(), clear=True):
+            with self.assertRaises(KeyboardInterrupt):
+                with materialize_codex_runtime(self.provider, None) as runtime:
+                    runtime_home = runtime.home
+                    rollout = runtime.home / "sessions" / relative
+                    rollout.parent.mkdir(parents=True, exist_ok=True)
+                    rollout.write_text(content, encoding="utf-8")
+                    with closing(sqlite3.connect(database)) as connection, connection:
+                        connection.execute(
+                            "INSERT INTO threads (id, rollout_path) VALUES (?, ?)",
+                            (thread_id, str(rollout)),
+                        )
+                    raise KeyboardInterrupt
+
+        shared_rollout = self.shared_home / "sessions" / relative
+        self.assertFalse(runtime_home.exists())
+        self.assertEqual(shared_rollout.read_text(encoding="utf-8"), content)
+        with closing(sqlite3.connect(database)) as connection:
+            repaired = connection.execute(
+                "SELECT rollout_path FROM threads WHERE id = ?", (thread_id,)
+            ).fetchone()[0]
+        self.assertEqual(repaired, str(shared_rollout.resolve()))
+
+    def test_segmented_rollout_still_requires_matching_filename_and_metadata(self):
+        thread_id = "01a0e6b4-0823-7832-98fc-e413e48fcf92"
+        other_id = "01a0e6d4-0825-7c62-869f-58a703f67d46"
+        for filename_id, suffix, metadata_id in (
+            (other_id, thread_id, thread_id),
+            (thread_id, "not-a-uuid", thread_id),
+            (thread_id, other_id, other_id),
+        ):
+            with self.subTest(filename_id=filename_id, suffix=suffix, metadata_id=metadata_id):
+                relative = Path(f"rollout-2026-09-28T15-04-10-{filename_id}_{suffix}.jsonl")
+                rollout = self.write_rollout(relative, metadata_id)
+                stale = self.root / "codex-candy-eval-codex-expired" / "sessions" / relative
+                self.assertIsNone(codex_runtime._shared_rollout_path(
+                    thread_id, str(stale), self.shared_home
+                ))
+                with mock.patch.dict(os.environ, self.environment(), clear=True):
+                    with materialize_codex_runtime(self.provider, None) as runtime:
+                        self.assertIsNone(codex_runtime._runtime_rollout_path(
+                            thread_id, str(rollout), runtime.home, self.shared_home
+                        ))
+
+    def test_local_skill_policy_applies_to_every_provider_without_shared_writes(self):
+        skill_path = str(self.root / "personal" / "hyperframes" / "SKILL.md")
+        policy_path = self.shared_home / ".cc-switch-tui" / "local-skills.toml"
+        policy_path.parent.mkdir()
+        policy = tomli_w.dumps({
+            "disabled_skills": [skill_path],
+            "skip_hyperframes_auto_install": True,
+        })
+        policy_path.write_text(policy, encoding="utf-8")
+        shared_config = self.shared_home / "config.toml"
+        shared_config.write_text('model = "shared-default"\n', encoding="utf-8")
+        other = SelectedProvider("other-provider", "codex", "other", deepcopy(PROVIDER_SETTINGS))
+
+        with mock.patch.dict(
+            os.environ, self.environment(HYPERFRAMES_SKIP_SKILLS="0"), clear=True
+        ):
+            for provider in (self.provider, other):
+                with materialize_codex_runtime(provider, None) as runtime:
+                    document = tomllib.loads(runtime.config_path.read_text())
+                    self.assertEqual(document["skills"]["config"], [
+                        {"path": skill_path, "enabled": False}
+                    ])
+                    self.assertEqual(runtime.environment["HYPERFRAMES_SKIP_SKILLS"], "1")
+                    self.assertEqual(
+                        document["shell_environment_policy"]["set"]["HYPERFRAMES_SKIP_SKILLS"],
+                        "1",
+                    )
+            self.assertEqual(os.environ["HYPERFRAMES_SKIP_SKILLS"], "0")
+
+        self.assertEqual(policy_path.read_text(), policy)
+        self.assertEqual(shared_config.read_text(), 'model = "shared-default"\n')
+
     def test_common_config_merges_structurally_when_supplied(self):
         plugin_id = self.install_plugin()
         common = f'''\
@@ -590,7 +801,7 @@ enabled = true
         self.assertEqual(config["model"], "gpt-common")
         self.assertTrue(config["plugins"][plugin_id]["enabled"])
 
-    def test_all_installed_project_defaults_are_enabled(self):
+    def test_installed_plugins_follow_project_defaults(self):
         self.install_default_plugins()
 
         with mock.patch.dict(os.environ, self.environment(), clear=True):
@@ -600,10 +811,10 @@ enabled = true
                 self.assertEqual(
                     {
                         plugin_id
-                        for plugin_id, entry in config["plugins"].items()
+                        for plugin_id, entry in config.get("plugins", {}).items()
                         if entry["enabled"]
                     },
-                    EXPECTED_DEFAULT_PLUGINS,
+                    set(EXPECTED_DEFAULT_PLUGINS),
                 )
                 self.assertEqual(runtime.warnings, ())
 
@@ -615,21 +826,27 @@ enabled = true
             self.shared_home / "plugins" / "cache" / marketplace / plugin
         )
 
-        with mock.patch.dict(os.environ, self.environment(), clear=True):
-            with materialize_codex_runtime(self.provider, None) as runtime:
-                config = tomllib.loads(runtime.config_path.read_text())
-                self.assertTrue(config["plugins"][plugin_id]["enabled"])
+        defaults = self.root / "defaults.toml"
+        defaults.write_text(
+            f'[plugins."{plugin_id}"]\nenabled = true\n',
+            encoding="utf-8",
+        )
+        with mock.patch.object(codex_runtime, "_DEFAULT_PLUGIN_CONFIG_PATH", defaults):
+            with mock.patch.dict(os.environ, self.environment(), clear=True):
+                with materialize_codex_runtime(self.provider, None) as runtime:
+                    config = tomllib.loads(runtime.config_path.read_text())
+                    self.assertTrue(config["plugins"][plugin_id]["enabled"])
 
-            shutil.rmtree(plugin_root)
-            with materialize_codex_runtime(self.provider, None) as runtime:
-                config = tomllib.loads(runtime.config_path.read_text())
-                self.assertNotIn(plugin_id, config.get("plugins", {}))
-                self.assertEqual(runtime.warnings, ())
+                shutil.rmtree(plugin_root)
+                with materialize_codex_runtime(self.provider, None) as runtime:
+                    config = tomllib.loads(runtime.config_path.read_text())
+                    self.assertNotIn(plugin_id, config.get("plugins", {}))
+                    self.assertEqual(runtime.warnings, ())
 
-            self.install_plugin(plugin, marketplace)
-            with materialize_codex_runtime(self.provider, None) as runtime:
-                config = tomllib.loads(runtime.config_path.read_text())
-                self.assertTrue(config["plugins"][plugin_id]["enabled"])
+                self.install_plugin(plugin, marketplace)
+                with materialize_codex_runtime(self.provider, None) as runtime:
+                    config = tomllib.loads(runtime.config_path.read_text())
+                    self.assertTrue(config["plugins"][plugin_id]["enabled"])
 
     def test_runtime_plugin_precedence_ends_with_provider_sidecar(self):
         plugin_id = CANONICAL_SUPERPOWERS_ID
@@ -1173,20 +1390,26 @@ class CodexRuntimeFinalizationTests(unittest.TestCase):
         plugin_id, _ = self.install_plugin(
             "superpowers", "openai-api-curated"
         )
+        defaults = self.root / "defaults.toml"
+        defaults.write_text(
+            f'[plugins."{plugin_id}"]\nenabled = true\n',
+            encoding="utf-8",
+        )
 
-        with mock.patch.dict(os.environ, self.environment(), clear=True):
-            with materialize_codex_runtime(self.provider, None) as runtime:
-                self.assertTrue(self.plugin_enabled(runtime, plugin_id))
-                self.set_plugin(runtime, plugin_id, False)
+        with mock.patch.object(codex_runtime, "_DEFAULT_PLUGIN_CONFIG_PATH", defaults):
+            with mock.patch.dict(os.environ, self.environment(), clear=True):
+                with materialize_codex_runtime(self.provider, None) as runtime:
+                    self.assertTrue(self.plugin_enabled(runtime, plugin_id))
+                    self.set_plugin(runtime, plugin_id, False)
 
-            self.assertEqual(
-                self.state.load_provider_plugins("provider-id"),
-                {plugin_id: False},
-            )
+                self.assertEqual(
+                    self.state.load_provider_plugins("provider-id"),
+                    {plugin_id: False},
+                )
 
-            with materialize_codex_runtime(self.provider, None) as runtime:
-                self.assertFalse(self.plugin_enabled(runtime, plugin_id))
-                self.set_plugin(runtime, plugin_id, True)
+                with materialize_codex_runtime(self.provider, None) as runtime:
+                    self.assertFalse(self.plugin_enabled(runtime, plugin_id))
+                    self.set_plugin(runtime, plugin_id, True)
 
         self.assertEqual(self.state.load_provider_plugins("provider-id"), {})
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -37,6 +38,7 @@ from codex_plugin_state import (
     plugin_flags,
     scan_plugin_inventory,
 )
+from codex_local_skills import apply_local_skill_policy
 
 
 DIRECTORY_SHARE_ALLOWLIST = (
@@ -382,6 +384,15 @@ def _synchronize_materialized_tree(runtime_path: Path, shared_path: Path) -> Non
         ) from None
 
 
+def _rollout_filename_matches_thread(filename: str, thread_id: str) -> bool:
+    """Accept both legacy rollouts and the thread_UUID segments in Codex 0.156.1.
+
+    Callers must also verify session_meta.payload.id before trusting the file.
+    """
+    segment = r"(?:_[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})?"
+    return re.search(rf"-{re.escape(thread_id)}{segment}\.jsonl\Z", filename) is not None
+
+
 def _runtime_rollout_path(
     thread_id: object,
     rollout_path: object,
@@ -417,8 +428,8 @@ def _runtime_rollout_path(
             resolved_target.relative_to(resolved_runtime_root)
             if (
                 not resolved_target.is_file()
-                or not resolved_target.name.endswith(
-                    f"-{thread_id}.jsonl"
+                or not _rollout_filename_matches_thread(
+                    resolved_target.name, thread_id
                 )
             ):
                 continue
@@ -544,6 +555,8 @@ def _shared_rollout_path(
     thread_id: object,
     rollout_path: object,
     shared_home: Path,
+    *,
+    runtime_home: Path | None = None,
 ) -> Path | None:
     if (
         not isinstance(thread_id, str)
@@ -574,12 +587,19 @@ def _shared_rollout_path(
     ):
         return None
     filename = relative_parts[-1]
-    if not filename.endswith(f"-{thread_id}.jsonl"):
+    if not _rollout_filename_matches_thread(filename, thread_id):
         return None
 
     shared_directory = shared_home / directory_name
     target = shared_directory.joinpath(*relative_parts)
     try:
+        source_home = Path(*parts[: runtime_index + 1])
+        if runtime_home is None:
+            # Preserve a path only while its indexed rollout is still present.
+            if source.exists():
+                return None
+        elif source_home.resolve() != runtime_home.resolve():
+            return None
         if target.is_symlink():
             return None
         resolved_sessions = shared_directory.resolve()
@@ -610,8 +630,10 @@ def _shared_rollout_path(
 def _repair_launcher_rollout_paths(
     sqlite_home: Path,
     shared_home: Path,
+    *,
+    runtime_home: Path | None = None,
 ) -> int:
-    """Rewrite launcher-temporary rollout paths to their shared session paths."""
+    """Restore expired runtime paths, or only the runtime being finalized."""
     repaired = 0
     try:
         candidates = []
@@ -655,6 +677,7 @@ def _repair_launcher_rollout_paths(
                     thread_id,
                     rollout_path,
                     shared_home,
+                    runtime_home=runtime_home,
                 )
                 if target is not None:
                     repairs.append((str(target), thread_id, rollout_path))
@@ -752,6 +775,9 @@ def _prepare_codex_runtime(
         final_document, auth_environment, auth_document = _codex_auth_parts(
             composed.document, provider.settings.get("auth")
         )
+        final_document, skill_environment = apply_local_skill_policy(
+            final_document, shared_home
+        )
         final_document.pop("sqlite_home", None)
         rendered = tomli_w.dumps(final_document)
         rendered_auth = json.dumps(auth_document, separators=(",", ":")) + "\n"
@@ -775,6 +801,7 @@ def _prepare_codex_runtime(
         environment["CODEX_HOME"] = str(runtime_home)
         environment["CODEX_SQLITE_HOME"] = str(shared_sqlite_home)
         environment.update(auth_environment)
+        environment.update(skill_environment)
         environment.setdefault("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "codex-tui")
         runtime = CodexRuntime(
             provider_id=provider.provider_id,
@@ -854,6 +881,7 @@ def _repair_runtime_rollout_paths_safely(
         _repair_launcher_rollout_paths(
             prepared.shared_sqlite_home,
             prepared.shared_home,
+            runtime_home=prepared.runtime.home,
         )
     except BaseException:
         return False

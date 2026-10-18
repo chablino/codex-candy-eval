@@ -512,6 +512,52 @@ class PluginStateStoreTests(unittest.TestCase):
         self.assertEqual(self.state.load_provider_plugins("first"), {})
         self.assertEqual(self.state.load_provider_plugins("second"), {})
 
+    def test_uninstalling_enabled_baseline_keeps_current_provider_disabled(self):
+        initial = self.snapshot({"demo@test": True}, {"demo@test"})
+        final = self.snapshot({}, set())
+
+        self.state.apply_runtime_changes(
+            "provider", {"demo@test": True}, initial, final
+        )
+
+        self.assertEqual(
+            self.state.load_provider_plugins("provider"), {"demo@test": False}
+        )
+
+    def test_global_uninstall_preserves_other_providers_disabled_switches(self):
+        enabled = self.snapshot({"demo@test": True}, {"demo@test"})
+        disabled = self.snapshot({"demo@test": False}, {"demo@test"})
+        self.state.apply_runtime_changes(
+            "disabled-provider", {"demo@test": True}, enabled, disabled
+        )
+        self.enable_plugin("enabled-provider")
+
+        self.state.apply_runtime_changes(
+            "uninstaller", {}, enabled, self.snapshot({}, set())
+        )
+
+        self.assertEqual(
+            self.state.load_provider_plugins("disabled-provider"),
+            {"demo@test": False},
+        )
+        self.assertEqual(self.state.load_provider_plugins("enabled-provider"), {})
+        self.assertEqual(self.state.load_provider_plugins("uninstaller"), {})
+
+    def test_uninstalling_already_disabled_plugin_keeps_its_switch(self):
+        enabled = self.snapshot({"demo@test": True}, {"demo@test"})
+        disabled = self.snapshot({"demo@test": False}, {"demo@test"})
+        self.state.apply_runtime_changes(
+            "provider", {"demo@test": True}, enabled, disabled
+        )
+
+        self.state.apply_runtime_changes(
+            "provider", {"demo@test": True}, disabled, self.snapshot({}, set())
+        )
+
+        self.assertEqual(
+            self.state.load_provider_plugins("provider"), {"demo@test": False}
+        )
+
     def test_marketplace_state_initializes_once_and_overrides_provider(self):
         initial = self.state.load_or_initialize_marketplaces(
             {"shared": {"source": "shared"}},

@@ -1,6 +1,6 @@
-[plugins."superpowers@openai-api-curated"]
-enabled = true
-
+# Match the five document plugins enabled by the normal `codex` configuration.
+# Superpowers and HyperFrames remain provider-on-demand and are intentionally
+# absent here.
 [plugins."documents@openai-primary-runtime"]
 enabled = true
 
@@ -10,14 +10,8 @@ enabled = true
 [plugins."presentations@openai-primary-runtime"]
 enabled = true
 
-[plugins."template-creator@openai-primary-runtime"]
-enabled = true
-
 [plugins."spreadsheets@openai-primary-runtime"]
 enabled = true
 
-[plugins."visualize@openai-bundled"]
-enabled = true
-
-[plugins."browser@openai-bundled"]
+[plugins."template-creator@openai-primary-runtime"]
 enabled = true

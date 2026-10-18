@@ -539,24 +539,28 @@ class PluginStateStore:
                     plugins,
                 )
 
+            if removed_inventory:
+                for path, (stored_provider, original, latest) in sidecars.items():
+                    for plugin_id in removed_inventory:
+                        # Uninstall invalidates saved enables, but a provider's
+                        # explicit disable must survive a later shared install.
+                        if latest.get(plugin_id) is True:
+                            latest.pop(plugin_id)
+                    sidecars[path] = (stored_provider, original, latest)
+
             if changed_plugins:
                 stored_provider, original, latest = sidecars[current_path]
                 for plugin_id in changed_plugins:
-                    if plugin_id in removed_inventory:
-                        latest.pop(plugin_id, None)
-                        continue
                     desired = final_plugins.get(plugin_id, False)
+                    if plugin_id in removed_inventory and desired:
+                        continue
+                    # Codex removes the config entry on uninstall. Persist that
+                    # as disabled when the provider/default baseline enables it.
                     if desired == baseline.get(plugin_id, False):
                         latest.pop(plugin_id, None)
                     else:
                         latest[plugin_id] = desired
                 sidecars[current_path] = (stored_provider, original, latest)
-
-            if removed_inventory:
-                for path, (stored_provider, original, latest) in sidecars.items():
-                    for plugin_id in removed_inventory:
-                        latest.pop(plugin_id, None)
-                    sidecars[path] = (stored_provider, original, latest)
 
             for path, (stored_provider, original, latest) in sidecars.items():
                 if latest == original:
