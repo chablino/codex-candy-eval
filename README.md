@@ -300,18 +300,32 @@ ln -s ~/.local/share/cometix-claude/node_modules/.bin/claude ~/.local/bin/cometi
 ```
 
 cometix 需要 Node.js 24 或更新版本，与官方版本使用同一个 `CLAUDE_CONFIG_DIR`（默认
-`~/.claude`）。cometix patcher 中靠环境变量开启的补丁（如 `CLAUDE_CLASSIFIER_MODEL`、
-`CLAUDE_CODE_CONTEXT_LIMIT`）如果只写在 `~/.claude/settings.json` 的 `env` 中，经启动器或
-selector 评测运行时不会生效，因为两者都不读取这个文件。请在 shell 中导出，或写进对应
-CC Switch provider 的 `env`。直接改写安装文件的补丁不受影响。
+`~/.claude`）。
+
+与 Codex 启动器相同，Claude 启动器和 selector 评测都不读取用户级
+`~/.claude/settings.json`，最终配置只来自 CC Switch：先取 provider 原始配置；仅当该
+provider 在 CC Switch 中开启 `Apply Common Config` 时，再把 Claude Common Config 递归合并
+上去。合并规则与 CC Switch App 一致：对象（如 `env`、`enabledPlugins`）按键合并，数组和
+标量整体替换，同名值以 Common Config 为准。未开启 `Apply Common Config` 的 provider 完全
+不会并入 Common Config。Common Config 为空时不产生任何效果；开启后若它缺失或不是 JSON
+对象，启动会报错退出，且错误信息不包含配置内容。
+
+因此，所有 provider 共用的设置，例如 `DISABLE_AUTOUPDATER`、`CLAUDE_CODE_EFFORT_LEVEL`，
+以及 cometix patcher 中靠环境变量开启的补丁（如 `CLAUDE_CLASSIFIER_MODEL`、
+`CLAUDE_CODE_CONTEXT_LIMIT`），应写进 CC Switch 的 Claude Common Config 的 `env`，
+或写进单个 provider 的 `env`。只写在 `~/.claude/settings.json` 中不会生效，也可以在
+shell 中直接导出。启动器会把合并后的 `env` 同时注入 Claude 子进程，因此在进程启动时
+读取环境变量的补丁也能拿到这些值。直接改写安装文件的补丁不受影响。新版 CC Switch App
+切换 Claude provider 时已不再合并 Common Config，但仍保存这段配置和 provider 的开关，
+本启动器继续按这两项生效。
 
 启动器只查找 `app_type=claude` 的 provider，并继续使用当前 `CLAUDE_CONFIG_DIR`（未设置时
 为 `~/.claude`），不会按 provider 隔离 sessions、history、projects、plugins 或 skills。
 因此配置 B 可以继续配置 A 创建的会话，CC Switch App 当前选择、已经运行的 Claude 窗口和
 共享 `settings.json` 都不会被修改。
 
-CC Switch 所选 provider 的完整配置（包括顶层 `env`）会写入权限为 `0600` 的临时
-settings 文件，同时同一份 `env` 会注入 Claude 子进程。启动命令固定使用
+CC Switch 所选 provider 的完整配置（包括顶层 `env`，以及按上述规则合并的 Common
+Config）会写入权限为 `0600` 的临时 settings 文件，同时同一份 `env` 会注入 Claude 子进程。启动命令固定使用
 `--setting-sources project,local` 保留正常的项目和 local settings，并通过优先级更高的
 `--settings` 确保指定 provider 的地址、凭证、模型映射和自定义 headers 最终生效。临时目录
 权限为 `0700`，token、地址和 headers 不会进入命令行、日志或公开错误；临时 settings

@@ -11,7 +11,7 @@ import tempfile
 from collections.abc import Iterator, Mapping, Sequence
 from copy import deepcopy
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -248,9 +248,10 @@ def _parse_provider_meta(
             f"provider {provider_id!r} metadata must contain a JSON object"
         )
     enabled = meta.get("commonConfigEnabled")
-    if app_type == "codex" and enabled is not None and not isinstance(enabled, bool):
+    if enabled is not None and not isinstance(enabled, bool):
+        app_label = "Codex" if app_type == "codex" else "Claude"
         raise CcSwitchConfigError(
-            f"Codex provider {provider_id!r} metadata "
+            f"{app_label} provider {provider_id!r} metadata "
             "commonConfigEnabled must be boolean"
         )
     return meta
@@ -281,11 +282,12 @@ def load_common_config(
     app_type: AppType, db_path: str | Path = DEFAULT_DB_PATH
 ) -> str:
     """Read the selected app's Common Config without mutating CC Switch."""
-    if app_type != "codex":
+    if app_type not in ("codex", "claude"):
         raise CcSwitchConfigError(
             f"unsupported Common Config app type: {app_type!r}"
         )
 
+    app_label = "Codex" if app_type == "codex" else "Claude"
     resolved_path = _resolve_database_path(db_path)
     connection: sqlite3.Connection | None = None
     rows: list[tuple[object, ...]] = []
@@ -295,7 +297,7 @@ def load_common_config(
         rows = list(
             connection.execute(
                 "SELECT value FROM settings WHERE key = ?",
-                ("common_config_codex",),
+                (f"common_config_{app_type}",),
             )
         )
     except sqlite3.Error:
@@ -305,10 +307,56 @@ def load_common_config(
             connection.close()
 
     if read_failed:
-        raise CcSwitchConfigError("failed to read Codex Common Config")
+        raise CcSwitchConfigError(f"failed to read {app_label} Common Config")
     if len(rows) != 1 or not isinstance(rows[0][0], str):
-        raise CcSwitchConfigError("Codex Common Config is missing or invalid")
+        raise CcSwitchConfigError(f"{app_label} Common Config is missing or invalid")
     return rows[0][0]
+
+
+def _json_deep_merge(
+    base: Mapping[str, Any], overlay: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Recursively merge JSON objects; arrays and scalars are replaced."""
+    merged = deepcopy(dict(base))
+    for key, value in overlay.items():
+        current = merged.get(key)
+        if isinstance(current, Mapping) and isinstance(value, Mapping):
+            merged[key] = _json_deep_merge(current, value)
+        else:
+            merged[key] = deepcopy(value)
+    return merged
+
+
+def _parse_claude_common_config(payload: str) -> dict[str, Any]:
+    if not payload.strip():
+        return {}
+    try:
+        common = json.loads(payload, parse_constant=_reject_json_constant)
+    except (json.JSONDecodeError, RecursionError, ValueError):
+        common = None
+    if not isinstance(common, dict) or (
+        "env" in common and not isinstance(common["env"], dict)
+    ):
+        raise CcSwitchConfigError(
+            "Claude Common Config must contain a JSON object"
+        )
+    return common
+
+
+def apply_claude_common_config(
+    provider: SelectedProvider, db_path: str | Path = DEFAULT_DB_PATH
+) -> SelectedProvider:
+    """Overlay Claude Common Config when the provider enables it in CC Switch.
+
+    Like the CC Switch App, the provider is the base and Common Config is
+    deep-merged over it, so Common Config wins on conflicting values.
+    """
+    if provider.meta.get("commonConfigEnabled") is not True:
+        return provider
+    common = _parse_claude_common_config(load_common_config("claude", db_path))
+    return replace(
+        provider, settings=_json_deep_merge(provider.settings, common)
+    )
 
 
 def _write_private_file(path: Path, content: str) -> None:
@@ -586,6 +634,8 @@ def use_provider(
         )
 
     provider = load_provider(app_type, selector, db_path)
+    if app_type == "claude":
+        provider = apply_claude_common_config(provider, db_path)
     with _sigterm_as_system_exit():
         with materialize_provider(provider) as runtime:
             yield runtime
@@ -602,7 +652,9 @@ def use_claude_profile(
             "--cc-switch-config is currently supported only on macOS/Linux"
         )
 
-    provider = load_provider("claude", selector, db_path)
+    provider = apply_claude_common_config(
+        load_provider("claude", selector, db_path), db_path
+    )
     with _sigterm_as_system_exit():
         with materialize_claude_profile(provider) as runtime:
             yield runtime

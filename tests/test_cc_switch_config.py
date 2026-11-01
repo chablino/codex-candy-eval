@@ -1237,6 +1237,128 @@ class ClaudeProfileRuntimeTests(unittest.TestCase):
         load.assert_not_called()
 
 
+class ClaudeCommonConfigTests(unittest.TestCase):
+    COMMON = {
+        "env": {
+            "DISABLE_AUTOUPDATER": "1",
+            "CLAUDE_CODE_EFFORT_LEVEL": "max",
+        },
+        "model": "opus",
+        "enabledPlugins": {"common@marketplace": True},
+    }
+
+    def setUp(self):
+        self.database = ProviderDatabase()
+        self.addCleanup(self.database.close)
+        self.database.create_schema()
+        self.database.set_setting("common_config_claude", json.dumps(self.COMMON))
+        environment = mock.patch.dict(os.environ, {}, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def insert_profile(self, enabled):
+        meta = {} if enabled is None else {"commonConfigEnabled": enabled}
+        self.database.insert(
+            "claude-id", "claude", "anyrouter", CLAUDE_PROFILE_SETTINGS, meta
+        )
+
+    def test_enabled_common_config_is_deep_merged_into_profile(self):
+        self.insert_profile(True)
+
+        with cc_switch_config.use_claude_profile(
+            "anyrouter", self.database.path
+        ) as runtime:
+            settings = json.loads(runtime.settings_path.read_text("utf-8"))
+
+        self.assertEqual(
+            settings["env"],
+            {**CLAUDE_PROFILE_SETTINGS["env"], **self.COMMON["env"]},
+        )
+        # Like the CC Switch App, Common Config wins on conflicting values.
+        self.assertEqual(settings["model"], "opus")
+        self.assertEqual(settings["effortLevel"], "high")
+        self.assertEqual(
+            settings["enabledPlugins"],
+            {"example@marketplace": True, "common@marketplace": True},
+        )
+        self.assertEqual(runtime.environment["DISABLE_AUTOUPDATER"], "1")
+        self.assertEqual(runtime.environment["CLAUDE_CODE_EFFORT_LEVEL"], "max")
+
+    def test_common_config_is_skipped_unless_enabled(self):
+        for enabled in (False, None):
+            with self.subTest(enabled=enabled):
+                self.database.path.unlink()
+                self.database.create_schema()
+                self.database.set_setting("common_config_claude", "not json")
+                self.insert_profile(enabled)
+
+                with cc_switch_config.use_claude_profile(
+                    "anyrouter", self.database.path
+                ) as runtime:
+                    settings = json.loads(
+                        runtime.settings_path.read_text("utf-8")
+                    )
+
+                self.assertEqual(settings, CLAUDE_PROFILE_SETTINGS)
+                self.assertNotIn("DISABLE_AUTOUPDATER", runtime.environment)
+
+    def test_selector_eval_runtime_also_merges_common_config(self):
+        self.insert_profile(True)
+
+        with use_provider("claude", "anyrouter", self.database.path) as runtime:
+            settings_path = (
+                Path(runtime.environment["CLAUDE_CONFIG_DIR"]) / "settings.json"
+            )
+            settings = json.loads(settings_path.read_text("utf-8"))
+
+        self.assertEqual(settings["env"]["DISABLE_AUTOUPDATER"], "1")
+        self.assertEqual(settings["model"], "opus")
+
+    def test_blank_common_config_is_a_no_op(self):
+        self.database.set_setting("common_config_claude", "  \n")
+        self.insert_profile(True)
+
+        with cc_switch_config.use_claude_profile(
+            "anyrouter", self.database.path
+        ) as runtime:
+            settings = json.loads(runtime.settings_path.read_text("utf-8"))
+
+        self.assertEqual(settings, CLAUDE_PROFILE_SETTINGS)
+
+    def test_invalid_common_config_is_rejected_without_leaking_payload(self):
+        self.insert_profile(True)
+        for payload in ('["leaky-secret"]', '{"env": "leaky-secret"}', "leaky-secret"):
+            with self.subTest(payload=payload):
+                self.database.set_setting("common_config_claude", payload)
+                with self.assertRaisesRegex(
+                    CcSwitchConfigError, "Claude Common Config"
+                ) as raised:
+                    with cc_switch_config.use_claude_profile(
+                        "anyrouter", self.database.path
+                    ):
+                        pass
+
+                self.assertNotIn("leaky-secret", str(raised.exception))
+                self.assertIsNone(raised.exception.__context__)
+
+    def test_missing_enabled_common_config_is_an_error(self):
+        self.database.path.unlink()
+        self.database.create_schema()
+        self.insert_profile(True)
+
+        with self.assertRaisesRegex(CcSwitchConfigError, "Claude Common Config"):
+            with cc_switch_config.use_claude_profile(
+                "anyrouter", self.database.path
+            ):
+                pass
+
+    def test_claude_provider_rejects_non_boolean_common_config_flag(self):
+        self.insert_profile("true")
+
+        with self.assertRaisesRegex(CcSwitchConfigError, "Claude provider"):
+            load_provider("claude", "anyrouter", self.database.path)
+
+
 class ClaudeProfileRuntimeApiTests(unittest.TestCase):
     def test_runtime_type_is_public(self):
         self.assertTrue(hasattr(cc_switch_config, "ClaudeProfileRuntime"))
