@@ -289,6 +289,22 @@ python3 /path/to/codex-candy-eval/claude_tui.py \
   --cc-switch-config anyrouter -- --resume SESSION_ID
 ```
 
+启动器和 `claude_candy_eval.py` 优先运行 PATH 中的 `cometix`
+（[@cometix/claude-code](https://github.com/CometixSpace/claude-code)，Claude Code 的 Node.js
+版本），找不到时才回退到官方 `claude`。cometix 的 npm 包命令名同样是 `claude`，与官方版本
+共存时，可以装到独立目录再链接成 `cometix`：
+
+```bash
+npm install --prefix ~/.local/share/cometix-claude @cometix/claude-code
+ln -s ~/.local/share/cometix-claude/node_modules/.bin/claude ~/.local/bin/cometix
+```
+
+cometix 需要 Node.js 24 或更新版本，与官方版本使用同一个 `CLAUDE_CONFIG_DIR`（默认
+`~/.claude`）。cometix patcher 中靠环境变量开启的补丁（如 `CLAUDE_CLASSIFIER_MODEL`、
+`CLAUDE_CODE_CONTEXT_LIMIT`）如果只写在 `~/.claude/settings.json` 的 `env` 中，经启动器或
+selector 评测运行时不会生效，因为两者都不读取这个文件。请在 shell 中导出，或写进对应
+CC Switch provider 的 `env`。直接改写安装文件的补丁不受影响。
+
 启动器只查找 `app_type=claude` 的 provider，并继续使用当前 `CLAUDE_CONFIG_DIR`（未设置时
 为 `~/.claude`），不会按 provider 隔离 sessions、history、projects、plugins 或 skills。
 因此配置 B 可以继续配置 A 创建的会话，CC Switch App 当前选择、已经运行的 Claude 窗口和

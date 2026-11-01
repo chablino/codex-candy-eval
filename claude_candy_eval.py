@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""用本地 claude CLI（Claude Code）测试糖果问题并判分。
+"""用本地 Claude Code CLI（优先 cometix，其次 claude）测试糖果问题并判分。
 """
 
 from __future__ import annotations
@@ -28,22 +28,25 @@ ANSWER_PATTERN = re.compile(r"(?<!\d)21(?!\d)")
 
 
 def resolve_claude_executable() -> str:
-    """找到可被 subprocess 直接启动的 claude 命令。
+    """找到可被 subprocess 直接启动的 Claude Code 命令。
+
+    优先使用 `cometix`（@cometix/claude-code，Claude Code 的 Node.js 版本），
+    PATH 中没有时才回退到官方 `claude`。
 
     Windows/npm 安装通常会同时生成 `claude`、`claude.cmd` 等入口。
     `shutil.which("claude")` 可能先命中无扩展名 shim，CreateProcess 无法直接运行，
     会报 WinError 193；因此 Windows 上优先选择 `.cmd`/`.exe`。
     """
     candidates = (
-        ("claude.cmd", "claude.exe", "claude")
+        ("cometix.cmd", "cometix.exe", "claude.cmd", "claude.exe", "cometix", "claude")
         if os.name == "nt"
-        else ("claude",)
+        else ("cometix", "claude")
     )
     for name in candidates:
         exe = shutil.which(name)
         if exe:
             return exe
-    raise RuntimeError("找不到 claude 可执行文件，请确认已安装并加入 PATH。")
+    raise RuntimeError("找不到 cometix 或 claude 可执行文件，请确认已安装并加入 PATH。")
 
 
 def run_claude(

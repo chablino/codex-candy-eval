@@ -180,6 +180,41 @@ class ClaudeCandyTests(unittest.TestCase):
             ("anyrouter", "sonnet", 2),
         )
 
+    def test_executable_prefers_cometix_over_official_claude(self):
+        paths = {"cometix": "/home/me/.local/bin/cometix", "claude": "/usr/bin/claude"}
+        with mock.patch.object(claude_candy_eval.os, "name", "posix"), mock.patch.object(
+            claude_candy_eval.shutil, "which", side_effect=paths.get
+        ):
+            self.assertEqual(
+                claude_candy_eval.resolve_claude_executable(),
+                "/home/me/.local/bin/cometix",
+            )
+
+    def test_executable_falls_back_to_official_claude(self):
+        with mock.patch.object(claude_candy_eval.os, "name", "posix"), mock.patch.object(
+            claude_candy_eval.shutil, "which", side_effect={"claude": "/usr/bin/claude"}.get
+        ) as which:
+            self.assertEqual(claude_candy_eval.resolve_claude_executable(), "/usr/bin/claude")
+
+        self.assertEqual(which.call_args_list, [mock.call("cometix"), mock.call("claude")])
+
+    def test_windows_executable_prefers_launchable_cometix(self):
+        cases = (
+            ({"cometix.cmd": "C:/npm/cometix.cmd", "claude.cmd": "C:/npm/claude.cmd"}, "C:/npm/cometix.cmd"),
+            # 无扩展名 shim 无法直接启动，可启动的 claude.cmd 优先于它。
+            ({"cometix": "C:/bin/cometix", "claude.cmd": "C:/npm/claude.cmd"}, "C:/npm/claude.cmd"),
+        )
+        for paths, expected in cases:
+            with self.subTest(paths=paths), mock.patch.object(
+                claude_candy_eval.os, "name", "nt"
+            ), mock.patch.object(claude_candy_eval.shutil, "which", side_effect=paths.get):
+                self.assertEqual(claude_candy_eval.resolve_claude_executable(), expected)
+
+    def test_missing_executable_names_both_commands(self):
+        with mock.patch.object(claude_candy_eval.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "cometix 或 claude"):
+                claude_candy_eval.resolve_claude_executable()
+
     def test_subprocess_receives_runtime_and_redacts_nonzero_error(self):
         environment = {"CLAUDE_CONFIG_DIR": "/private/runtime"}
         with mock.patch.object(

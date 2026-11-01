@@ -135,7 +135,9 @@ class MainTests(unittest.TestCase):
         forwarded = ["--resume", "session-id", "--model", "sonnet"]
 
         with mock.patch.object(
-            claude_tui.shutil, "which", return_value="/usr/local/bin/claude"
+            claude_tui.shutil,
+            "which",
+            side_effect={"claude": "/usr/local/bin/claude"}.get,
         ) as which, mock.patch.object(
             claude_tui, "use_claude_profile", return_value=manager
         ) as use_profile, mock.patch.object(
@@ -146,7 +148,9 @@ class MainTests(unittest.TestCase):
             )
 
         self.assertEqual(result, 17)
-        which.assert_called_once_with("claude")
+        self.assertEqual(
+            which.call_args_list, [mock.call("cometix"), mock.call("claude")]
+        )
         use_profile.assert_called_once_with("anyrouter")
         run.assert_called_once_with(
             [
@@ -162,6 +166,29 @@ class MainTests(unittest.TestCase):
         self.assertNotIn("provider-secret", run.call_args.args[0])
         manager.__enter__.assert_called_once_with()
         manager.__exit__.assert_called_once()
+
+    def test_prefers_cometix_over_official_claude(self):
+        manager = self.runtime_context()
+        paths = {
+            "cometix": "/Users/me/.local/bin/cometix",
+            "claude": "/usr/local/bin/claude",
+        }
+
+        with mock.patch.object(
+            claude_tui.shutil, "which", side_effect=paths.get
+        ), mock.patch.object(
+            claude_tui, "use_claude_profile", return_value=manager
+        ), mock.patch.object(
+            claude_tui.subprocess,
+            "run",
+            return_value=mock.Mock(returncode=0),
+        ) as run:
+            result = claude_tui.main(["--cc-switch-config", "anyrouter"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            run.call_args.args[0][0], "/Users/me/.local/bin/cometix"
+        )
 
     def test_launches_without_forwarded_arguments(self):
         manager = self.runtime_context()
@@ -203,6 +230,7 @@ class MainTests(unittest.TestCase):
 
         self.assertEqual(result, 2)
         self.assertIn("Claude Code", stderr.getvalue())
+        self.assertIn("cometix", stderr.getvalue())
         use_profile.assert_not_called()
         run.assert_not_called()
 

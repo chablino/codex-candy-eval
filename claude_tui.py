@@ -10,6 +10,10 @@ from collections.abc import Sequence
 
 from cc_switch_config import CcSwitchConfigError, use_claude_profile
 
+# cometix (@cometix/claude-code, the Node.js build) is preferred; the official
+# claude is used only when no cometix command is on PATH.
+_CLAUDE_EXECUTABLES = ("cometix", "claude")
+
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -47,12 +51,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return arguments
 
 
+def _find_claude_executable() -> str | None:
+    for name in _CLAUDE_EXECUTABLES:
+        executable = shutil.which(name)
+        if executable is not None:
+            return executable
+    return None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = parse_args(argv)
-    executable = shutil.which("claude")
+    executable = _find_claude_executable()
     if executable is None:
         print(
-            "ERROR: Claude Code executable was not found in PATH",
+            "ERROR: Claude Code executable (cometix or claude) "
+            "was not found in PATH",
             file=sys.stderr,
         )
         return 2
