@@ -271,6 +271,7 @@ class ClaudeCandyTests(unittest.TestCase):
         runtime = SimpleNamespace(
             environment={"CLAUDE_CONFIG_DIR": "/private/runtime"},
             redact=lambda text: text.replace("secret", "<redacted>"),
+            default_effort=None,
         )
         context_calls = []
         run_calls = []
@@ -300,6 +301,32 @@ class ClaudeCandyTests(unittest.TestCase):
         self.assertEqual(len(run_calls), 2)
         self.assertTrue(all(call[2] is runtime.environment for call in run_calls))
         self.assertTrue(all(call[3] is runtime.redact for call in run_calls))
+
+    def test_configured_effort_applies_only_without_reasoning_effort(self):
+        runtime = SimpleNamespace(
+            environment={"CLAUDE_CONFIG_DIR": "/private/runtime"},
+            redact=lambda text: text,
+            default_effort="max",
+        )
+
+        @contextmanager
+        def fake_use_provider(app_type, selector, db_path=cc_switch_config.DEFAULT_DB_PATH):
+            yield runtime
+
+        for argv, expected in (([], "max"), (["-r", "high"], "high")):
+            with self.subTest(argv=argv), mock.patch.object(
+                cc_switch_config, "use_provider", side_effect=fake_use_provider
+            ), mock.patch.object(
+                claude_candy_eval, "run_claude", return_value=("answer 21", 1, 2)
+            ) as run_claude, mock.patch.object(
+                claude_candy_eval, "setup_console", return_value=False
+            ), redirect_stdout(io.StringIO()):
+                result = claude_candy_eval.main(
+                    ["--cc-switch-config", "anyrouter", *argv]
+                )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(run_claude.call_args.args, (None, expected))
 
     def test_no_selector_does_not_load_cc_switch_provider(self):
         with mock.patch.object(claude_candy_eval, "setup_console", return_value=False), mock.patch.object(

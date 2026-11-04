@@ -51,6 +51,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return arguments
 
 
+def _has_effort_argument(arguments: Sequence[str]) -> bool:
+    return any(
+        argument == "--effort" or argument.startswith("--effort=")
+        for argument in arguments
+    )
+
+
 def _find_claude_executable() -> str | None:
     for name in _CLAUDE_EXECUTABLES:
         executable = shutil.which(name)
@@ -72,6 +79,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         with use_claude_profile(arguments.cc_switch_config) as runtime:
+            effort_arguments = (
+                ["--effort", runtime.default_effort]
+                if runtime.default_effort is not None
+                and not _has_effort_argument(arguments.claude_args)
+                else []
+            )
             process = subprocess.run(
                 [
                     executable,
@@ -79,6 +92,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "project,local",
                     "--settings",
                     str(runtime.settings_path),
+                    *effort_arguments,
                     *arguments.claude_args,
                 ],
                 env=runtime.environment,

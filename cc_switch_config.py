@@ -19,6 +19,7 @@ from typing import Any, Literal
 AppType = Literal["codex", "claude"]
 
 DEFAULT_DB_PATH = Path.home() / ".cc-switch" / "cc-switch.db"
+CLAUDE_LIVE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 REQUIRED_PROVIDER_COLUMNS = frozenset(
     {"id", "app_type", "name", "settings_config", "meta"}
 )
@@ -43,6 +44,7 @@ class ProviderRuntime:
     provider_name: str
     environment: Mapping[str, str] = field(repr=False)
     secrets: tuple[str, ...] = field(repr=False)
+    default_effort: str | None = None
 
     def redact(self, text: str) -> str:
         return redact_text(text, self.secrets)
@@ -54,6 +56,7 @@ class ClaudeProfileRuntime:
     provider_name: str
     settings_path: Path
     environment: Mapping[str, str] = field(repr=False)
+    default_effort: str | None = None
 
 
 def _open_read_only(db_path: Path) -> sqlite3.Connection:
@@ -327,20 +330,18 @@ def _json_deep_merge(
     return merged
 
 
-def _parse_claude_common_config(payload: str) -> dict[str, Any]:
+def _parse_claude_settings(payload: str, label: str) -> dict[str, Any]:
     if not payload.strip():
         return {}
     try:
-        common = json.loads(payload, parse_constant=_reject_json_constant)
+        settings = json.loads(payload, parse_constant=_reject_json_constant)
     except (json.JSONDecodeError, RecursionError, ValueError):
-        common = None
-    if not isinstance(common, dict) or (
-        "env" in common and not isinstance(common["env"], dict)
+        settings = None
+    if not isinstance(settings, dict) or (
+        "env" in settings and not isinstance(settings["env"], dict)
     ):
-        raise CcSwitchConfigError(
-            "Claude Common Config must contain a JSON object"
-        )
-    return common
+        raise CcSwitchConfigError(f"{label} must contain a JSON object")
+    return settings
 
 
 def apply_claude_common_config(
@@ -353,10 +354,71 @@ def apply_claude_common_config(
     """
     if provider.meta.get("commonConfigEnabled") is not True:
         return provider
-    common = _parse_claude_common_config(load_common_config("claude", db_path))
+    common = _parse_claude_settings(
+        load_common_config("claude", db_path), "Claude Common Config"
+    )
     return replace(
         provider, settings=_json_deep_merge(provider.settings, common)
     )
+
+
+_CLAUDE_EFFORT_ENV_KEY = "CLAUDE_CODE_EFFORT_LEVEL"
+_CLAUDE_LAUNCH_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def _load_claude_live_effort() -> str | None:
+    payload = ""
+    read_failed = False
+    try:
+        payload = CLAUDE_LIVE_SETTINGS_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        pass
+    except (OSError, UnicodeDecodeError):
+        read_failed = True
+
+    if read_failed:
+        raise CcSwitchConfigError("failed to read Claude settings file")
+    settings = _parse_claude_settings(payload, "Claude settings file")
+    value = settings.get("env", {}).get(_CLAUDE_EFFORT_ENV_KEY)
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def apply_claude_live_effort(provider: SelectedProvider) -> SelectedProvider:
+    """Prefer the effort level in Claude's live settings file.
+
+    CC Switch treats CLAUDE_CODE_EFFORT_LEVEL as a global setting: its editor
+    writes the value to the live file and leaves any copy in the provider row
+    as it was, so the row and Common Config are only fallbacks.
+    """
+    value = _load_claude_live_effort()
+    if value is None:
+        return provider
+    return replace(
+        provider,
+        settings=_json_deep_merge(
+            provider.settings, {"env": {_CLAUDE_EFFORT_ENV_KEY: value}}
+        ),
+    )
+
+
+def _take_claude_default_effort(settings: dict[str, Any]) -> str | None:
+    """Move a configured effort level out of env so /effort can change it.
+
+    Claude Code lets CLAUDE_CODE_EFFORT_LEVEL override effort for the whole
+    session, while --effort only sets the starting level. Values that --effort
+    does not accept, such as auto or unset, stay in env unchanged.
+    """
+    environment = settings.get("env")
+    if not isinstance(environment, dict):
+        return None
+    value = environment.get(_CLAUDE_EFFORT_ENV_KEY)
+    if not isinstance(value, str):
+        return None
+    level = value.strip().lower()
+    if level not in _CLAUDE_LAUNCH_EFFORTS:
+        return None
+    del environment[_CLAUDE_EFFORT_ENV_KEY]
+    return level
 
 
 def _write_private_file(path: Path, content: str) -> None:
@@ -413,6 +475,7 @@ def _prepare_provider_runtime(
     temporary_directory: tempfile.TemporaryDirectory[str] | None = None
     setup_error: BaseException | None = None
     runtime: ProviderRuntime | None = None
+    default_effort: str | None = None
 
     try:
         temporary_directory = tempfile.TemporaryDirectory(
@@ -429,11 +492,11 @@ def _prepare_provider_runtime(
             environment_key = "CODEX_HOME"
             secret_source = provider.settings["auth"]
         elif provider.app_type == "claude":
-            _write_private_file(
-                root / "settings.json", _json_document(provider.settings)
-            )
+            settings = deepcopy(provider.settings)
+            default_effort = _take_claude_default_effort(settings)
+            _write_private_file(root / "settings.json", _json_document(settings))
             environment_key = "CLAUDE_CONFIG_DIR"
-            secret_source = provider.settings.get("env", {})
+            secret_source = settings.get("env", {})
         else:
             raise ValueError("unsupported provider app type")
 
@@ -444,6 +507,7 @@ def _prepare_provider_runtime(
             provider_name=provider.name,
             environment=environment,
             secrets=_collect_secrets(secret_source),
+            default_effort=default_effort,
         )
     except BaseException as exc:
         setup_error = exc
@@ -542,6 +606,9 @@ def _prepare_claude_profile(
 
     try:
         profile_settings, provider_environment = _claude_profile_parts(provider)
+        # provider_environment is profile_settings["env"], so the level leaves
+        # both the settings file and the child environment.
+        default_effort = _take_claude_default_effort(profile_settings)
         environment = os.environ.copy()
         for key in _CLAUDE_PARENT_AUTH_KEYS:
             environment.pop(key, None)
@@ -559,6 +626,7 @@ def _prepare_claude_profile(
             provider_name=provider.name,
             settings_path=settings_path,
             environment=environment,
+            default_effort=default_effort,
         )
     except BaseException as exc:
         setup_error = exc
@@ -635,7 +703,9 @@ def use_provider(
 
     provider = load_provider(app_type, selector, db_path)
     if app_type == "claude":
-        provider = apply_claude_common_config(provider, db_path)
+        provider = apply_claude_live_effort(
+            apply_claude_common_config(provider, db_path)
+        )
     with _sigterm_as_system_exit():
         with materialize_provider(provider) as runtime:
             yield runtime
@@ -652,8 +722,10 @@ def use_claude_profile(
             "--cc-switch-config is currently supported only on macOS/Linux"
         )
 
-    provider = apply_claude_common_config(
-        load_provider("claude", selector, db_path), db_path
+    provider = apply_claude_live_effort(
+        apply_claude_common_config(
+            load_provider("claude", selector, db_path), db_path
+        )
     )
     with _sigterm_as_system_exit():
         with materialize_claude_profile(provider) as runtime:

@@ -302,22 +302,37 @@ ln -s ~/.local/share/cometix-claude/node_modules/.bin/claude ~/.local/bin/cometi
 cometix 需要 Node.js 24 或更新版本，与官方版本使用同一个 `CLAUDE_CONFIG_DIR`（默认
 `~/.claude`）。
 
-与 Codex 启动器相同，Claude 启动器和 selector 评测都不读取用户级
-`~/.claude/settings.json`，最终配置只来自 CC Switch：先取 provider 原始配置；仅当该
-provider 在 CC Switch 中开启 `Apply Common Config` 时，再把 Claude Common Config 递归合并
-上去。合并规则与 CC Switch App 一致：对象（如 `env`、`enabledPlugins`）按键合并，数组和
-标量整体替换，同名值以 Common Config 为准。未开启 `Apply Common Config` 的 provider 完全
-不会并入 Common Config。Common Config 为空时不产生任何效果；开启后若它缺失或不是 JSON
-对象，启动会报错退出，且错误信息不包含配置内容。
+Claude 启动器和 selector 评测不读取用户级 `~/.claude/settings.json` 的其他内容，这一点
+与 Codex 启动器相同；唯一的例外是下文的 `CLAUDE_CODE_EFFORT_LEVEL`。最终配置来自 CC Switch：
+先取 provider 原始配置；仅当该 provider 在 CC Switch 中开启 `Apply Common Config` 时，再把
+Claude Common Config 递归合并上去。合并规则与 CC Switch App 一致：对象（如 `env`、
+`enabledPlugins`）按键合并，数组和标量整体替换，同名值以 Common Config 为准。未开启
+`Apply Common Config` 的 provider 完全不会并入 Common Config。Common Config 为空时不产生
+任何效果；开启后若它缺失或不是 JSON 对象，启动会报错退出，且错误信息不包含配置内容。
 
-因此，所有 provider 共用的设置，例如 `DISABLE_AUTOUPDATER`、`CLAUDE_CODE_EFFORT_LEVEL`，
-以及 cometix patcher 中靠环境变量开启的补丁（如 `CLAUDE_CLASSIFIER_MODEL`、
-`CLAUDE_CODE_CONTEXT_LIMIT`），应写进 CC Switch 的 Claude Common Config 的 `env`，
-或写进单个 provider 的 `env`。只写在 `~/.claude/settings.json` 中不会生效，也可以在
-shell 中直接导出。启动器会把合并后的 `env` 同时注入 Claude 子进程，因此在进程启动时
-读取环境变量的补丁也能拿到这些值。直接改写安装文件的补丁不受影响。新版 CC Switch App
-切换 Claude provider 时已不再合并 Common Config，但仍保存这段配置和 provider 的开关，
-本启动器继续按这两项生效。
+因此，所有 provider 共用的设置，例如 `DISABLE_AUTOUPDATER`，以及 cometix patcher 中靠环境
+变量开启的补丁（如 `CLAUDE_CLASSIFIER_MODEL`、`CLAUDE_CODE_CONTEXT_LIMIT`），应写进
+CC Switch 的 Claude Common Config 的 `env`，或写进单个 provider 的 `env`。只写在
+`~/.claude/settings.json` 中不会生效，也可以在 shell 中直接导出。启动器会把合并后的 `env`
+同时注入 Claude 子进程，因此在进程启动时读取环境变量的补丁也能拿到这些值。直接改写安装
+文件的补丁不受影响。新版 CC Switch App 切换 Claude provider 时已不再合并 Common Config，
+但仍保存这段配置和 provider 的开关，本启动器继续按这两项生效。
+
+`CLAUDE_CODE_EFFORT_LEVEL` 是个例外。CC Switch App 把它当作所有 provider 共用的全局设置：
+在编辑面板里修改时只写进 `~/.claude/settings.json`，provider 数据库记录中的旧值不会更新。
+因此这一项优先取 `~/.claude/settings.json` 的 `env`，对所有 provider 生效；这里没有或为空
+时才用 provider 自身或已合并的 Common Config。这个文件不存在时直接回退；文件无法读取或不是
+JSON 对象时，启动会报错退出，且错误信息不包含配置内容。
+
+Claude Code 还把这个环境变量当作整个会话的强制值，设置后 `/effort` 只会提示
+`CLAUDE_CODE_EFFORT_LEVEL=max overrides this session`，无法切换。因此启动器会把上述来源中
+取值为 `low`、`medium`、`high`、`xhigh` 或 `max` 的这一项从 `env` 中移除，改为启动参数
+`--effort`。它只决定会话的初始强度，进入后仍可以用 `/effort` 随时切换，与 Codex 中
+`model_reasoning_effort` 作为默认值的用法一致。`/effort` 保存到 `modelSettings` 的默认值
+不会被启动器读取，要改默认值请改 `CLAUDE_CODE_EFFORT_LEVEL`。转发参数中显式传入的
+`--effort` 优先；`auto`、`unset` 等 `--effort` 不接受的取值保持原样留在 `env` 中。在 shell
+中导出的 `CLAUDE_CODE_EFFORT_LEVEL` 不会被改动，仍会锁定整个会话。selector 评测也按同样
+规则处理：未传 `-r` 时使用这个值，传了 `-r` 则以 `-r` 为准，不会再被它悄悄覆盖。
 
 启动器只查找 `app_type=claude` 的 provider，并继续使用当前 `CLAUDE_CONFIG_DIR`（未设置时
 为 `~/.claude`），不会按 provider 隔离 sessions、history、projects、plugins 或 skills。

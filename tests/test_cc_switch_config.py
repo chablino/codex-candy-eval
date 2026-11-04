@@ -26,6 +26,22 @@ from cc_switch_config import (
 )
 
 
+# Claude runtimes read this file on every launch, so keep tests off the real one.
+_LIVE_SETTINGS_PATCH = mock.patch.object(
+    cc_switch_config,
+    "CLAUDE_LIVE_SETTINGS_PATH",
+    Path("/nonexistent/claude/settings.json"),
+)
+
+
+def setUpModule():
+    _LIVE_SETTINGS_PATCH.start()
+
+
+def tearDownModule():
+    _LIVE_SETTINGS_PATCH.stop()
+
+
 CODEX_SETTINGS = {
     "config": """\
 model = "gpt-test"
@@ -1272,7 +1288,7 @@ class ClaudeCommonConfigTests(unittest.TestCase):
 
         self.assertEqual(
             settings["env"],
-            {**CLAUDE_PROFILE_SETTINGS["env"], **self.COMMON["env"]},
+            {**CLAUDE_PROFILE_SETTINGS["env"], "DISABLE_AUTOUPDATER": "1"},
         )
         # Like the CC Switch App, Common Config wins on conflicting values.
         self.assertEqual(settings["model"], "opus")
@@ -1282,7 +1298,8 @@ class ClaudeCommonConfigTests(unittest.TestCase):
             {"example@marketplace": True, "common@marketplace": True},
         )
         self.assertEqual(runtime.environment["DISABLE_AUTOUPDATER"], "1")
-        self.assertEqual(runtime.environment["CLAUDE_CODE_EFFORT_LEVEL"], "max")
+        self.assertEqual(runtime.default_effort, "max")
+        self.assertNotIn("CLAUDE_CODE_EFFORT_LEVEL", runtime.environment)
 
     def test_common_config_is_skipped_unless_enabled(self):
         for enabled in (False, None):
@@ -1312,7 +1329,9 @@ class ClaudeCommonConfigTests(unittest.TestCase):
             settings = json.loads(settings_path.read_text("utf-8"))
 
         self.assertEqual(settings["env"]["DISABLE_AUTOUPDATER"], "1")
+        self.assertNotIn("CLAUDE_CODE_EFFORT_LEVEL", settings["env"])
         self.assertEqual(settings["model"], "opus")
+        self.assertEqual(runtime.default_effort, "max")
 
     def test_blank_common_config_is_a_no_op(self):
         self.database.set_setting("common_config_claude", "  \n")
@@ -1357,6 +1376,273 @@ class ClaudeCommonConfigTests(unittest.TestCase):
 
         with self.assertRaisesRegex(CcSwitchConfigError, "Claude provider"):
             load_provider("claude", "anyrouter", self.database.path)
+
+
+class ClaudeDefaultEffortTests(unittest.TestCase):
+    def provider(self, effort):
+        settings = deepcopy(CLAUDE_PROFILE_SETTINGS)
+        settings["env"]["CLAUDE_CODE_EFFORT_LEVEL"] = effort
+        return SelectedProvider("claude-id", "claude", "anyrouter", settings)
+
+    def test_profile_moves_effort_level_out_of_env(self):
+        provider = self.provider(" Max ")
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with cc_switch_config.materialize_claude_profile(provider) as runtime:
+                settings = json.loads(runtime.settings_path.read_text("utf-8"))
+
+        self.assertEqual(runtime.default_effort, "max")
+        self.assertEqual(settings["env"], CLAUDE_PROFILE_SETTINGS["env"])
+        self.assertNotIn("CLAUDE_CODE_EFFORT_LEVEL", runtime.environment)
+        self.assertEqual(
+            provider.settings["env"]["CLAUDE_CODE_EFFORT_LEVEL"], " Max "
+        )
+
+    def test_values_rejected_by_effort_flag_stay_in_env(self):
+        for effort in ("auto", "unset", "32000", "ultracode", ""):
+            with self.subTest(effort=effort), mock.patch.dict(
+                os.environ, {}, clear=True
+            ):
+                with cc_switch_config.materialize_claude_profile(
+                    self.provider(effort)
+                ) as runtime:
+                    settings = json.loads(
+                        runtime.settings_path.read_text("utf-8")
+                    )
+
+                self.assertIsNone(runtime.default_effort)
+                self.assertEqual(
+                    settings["env"]["CLAUDE_CODE_EFFORT_LEVEL"], effort
+                )
+                self.assertEqual(
+                    runtime.environment["CLAUDE_CODE_EFFORT_LEVEL"], effort
+                )
+
+    def test_shell_exported_effort_level_is_kept(self):
+        with mock.patch.dict(
+            os.environ, {"CLAUDE_CODE_EFFORT_LEVEL": "low"}, clear=True
+        ):
+            with cc_switch_config.materialize_claude_profile(
+                self.provider("max")
+            ) as runtime:
+                self.assertEqual(runtime.default_effort, "max")
+                self.assertEqual(
+                    runtime.environment["CLAUDE_CODE_EFFORT_LEVEL"], "low"
+                )
+
+    def test_eval_runtime_moves_effort_level_out_of_settings(self):
+        provider = self.provider("xhigh")
+
+        with materialize_provider(provider) as runtime:
+            settings_path = (
+                Path(runtime.environment["CLAUDE_CONFIG_DIR"]) / "settings.json"
+            )
+            settings = json.loads(settings_path.read_text("utf-8"))
+
+        self.assertEqual(runtime.default_effort, "xhigh")
+        self.assertEqual(settings["env"], CLAUDE_PROFILE_SETTINGS["env"])
+        self.assertEqual(
+            provider.settings["env"]["CLAUDE_CODE_EFFORT_LEVEL"], "xhigh"
+        )
+
+        codex = SelectedProvider(
+            "codex-id", "codex", "provider", deepcopy(CODEX_SETTINGS)
+        )
+        with materialize_provider(codex) as runtime:
+            self.assertIsNone(runtime.default_effort)
+
+
+class ClaudeLiveEffortTests(unittest.TestCase):
+    def setUp(self):
+        self.database = ProviderDatabase()
+        self.addCleanup(self.database.close)
+        self.database.create_schema()
+        self.database.set_setting(
+            "common_config_claude",
+            json.dumps({"env": {"CLAUDE_CODE_EFFORT_LEVEL": "max"}}),
+        )
+        self.live_path = self.database.path.parent / "settings.json"
+        for patcher in (
+            mock.patch.object(
+                cc_switch_config, "CLAUDE_LIVE_SETTINGS_PATH", self.live_path
+            ),
+            mock.patch.dict(os.environ, {}, clear=True),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def insert_profile(self, common_config=False):
+        settings = deepcopy(CLAUDE_PROFILE_SETTINGS)
+        settings["env"]["CLAUDE_CODE_EFFORT_LEVEL"] = "high"
+        self.database.insert(
+            "claude-id",
+            "claude",
+            "anyrouter",
+            settings,
+            {"commonConfigEnabled": common_config},
+        )
+
+    def write_live(self, settings):
+        self.live_path.write_text(json.dumps(settings), "utf-8")
+
+    def write_live_effort(self, effort):
+        self.write_live({"env": {"CLAUDE_CODE_EFFORT_LEVEL": effort}})
+
+    def assert_profile_starts_at(self, effort):
+        with cc_switch_config.use_claude_profile(
+            "anyrouter", self.database.path
+        ) as runtime:
+            settings = json.loads(runtime.settings_path.read_text("utf-8"))
+
+        self.assertEqual(runtime.default_effort, effort)
+        self.assertNotIn("CLAUDE_CODE_EFFORT_LEVEL", settings["env"])
+        self.assertNotIn("CLAUDE_CODE_EFFORT_LEVEL", runtime.environment)
+
+    def test_live_level_replaces_provider_level(self):
+        self.insert_profile()
+        self.write_live_effort("xhigh")
+
+        self.assert_profile_starts_at("xhigh")
+
+    def test_live_level_replaces_common_config_level(self):
+        self.insert_profile(common_config=True)
+        self.write_live_effort("xhigh")
+
+        self.assert_profile_starts_at("xhigh")
+
+    def test_eval_runtime_uses_live_level(self):
+        self.insert_profile()
+        self.write_live_effort("xhigh")
+
+        with use_provider("claude", "anyrouter", self.database.path) as runtime:
+            settings_path = (
+                Path(runtime.environment["CLAUDE_CONFIG_DIR"]) / "settings.json"
+            )
+            settings = json.loads(settings_path.read_text("utf-8"))
+
+        self.assertEqual(runtime.default_effort, "xhigh")
+        self.assertNotIn("CLAUDE_CODE_EFFORT_LEVEL", settings["env"])
+
+    def test_provider_level_is_used_without_live_level(self):
+        self.insert_profile()
+        self.assert_profile_starts_at("high")
+
+        for payload in (
+            "",
+            "{}",
+            '{"env": {}}',
+            '{"env": {"CLAUDE_CODE_EFFORT_LEVEL": " "}}',
+            '{"env": {"CLAUDE_CODE_EFFORT_LEVEL": 3}}',
+        ):
+            with self.subTest(payload=payload):
+                self.live_path.write_text(payload, "utf-8")
+                self.assert_profile_starts_at("high")
+
+    def test_common_config_level_is_used_without_live_level(self):
+        self.insert_profile(common_config=True)
+        self.write_live({"env": {}})
+
+        self.assert_profile_starts_at("max")
+
+    def test_live_value_rejected_by_effort_flag_replaces_provider_level(self):
+        self.insert_profile()
+        self.write_live_effort("auto")
+
+        with cc_switch_config.use_claude_profile(
+            "anyrouter", self.database.path
+        ) as runtime:
+            settings = json.loads(runtime.settings_path.read_text("utf-8"))
+
+        self.assertIsNone(runtime.default_effort)
+        self.assertEqual(settings["env"]["CLAUDE_CODE_EFFORT_LEVEL"], "auto")
+        self.assertEqual(runtime.environment["CLAUDE_CODE_EFFORT_LEVEL"], "auto")
+
+    def test_only_effort_level_is_read_from_live_settings(self):
+        self.insert_profile()
+        self.write_live(
+            {
+                "env": {
+                    "CLAUDE_CODE_EFFORT_LEVEL": "xhigh",
+                    "ANTHROPIC_BASE_URL": "https://live.example/v1",
+                    "LIVE_ONLY": "1",
+                },
+                "model": "live-model",
+                "enabledPlugins": {"live@marketplace": True},
+            }
+        )
+
+        with cc_switch_config.use_claude_profile(
+            "anyrouter", self.database.path
+        ) as runtime:
+            settings = json.loads(runtime.settings_path.read_text("utf-8"))
+
+        self.assertEqual(settings, CLAUDE_PROFILE_SETTINGS)
+        self.assertNotIn("LIVE_ONLY", runtime.environment)
+
+    def test_applying_live_level_leaves_provider_unchanged(self):
+        provider = SelectedProvider(
+            "claude-id", "claude", "anyrouter", deepcopy(CLAUDE_PROFILE_SETTINGS)
+        )
+        self.write_live_effort("xhigh")
+
+        applied = cc_switch_config.apply_claude_live_effort(provider)
+
+        self.assertEqual(applied.settings["env"]["CLAUDE_CODE_EFFORT_LEVEL"], "xhigh")
+        self.assertEqual(provider.settings, CLAUDE_PROFILE_SETTINGS)
+
+    def test_invalid_live_settings_fail_without_content(self):
+        self.insert_profile()
+
+        for payload in (
+            '{"env": "live-secret"',
+            '["live-secret"]',
+            '{"env": "live-secret"}',
+        ):
+            with self.subTest(payload=payload):
+                self.live_path.write_text(payload, "utf-8")
+
+                with self.assertRaisesRegex(
+                    CcSwitchConfigError,
+                    "Claude settings file must contain a JSON object",
+                ) as raised:
+                    with cc_switch_config.use_claude_profile(
+                        "anyrouter", self.database.path
+                    ):
+                        pass
+
+                self.assertNotIn("live-secret", str(raised.exception))
+                self.assertIsNone(raised.exception.__context__)
+
+    def test_unreadable_live_settings_fail_without_content(self):
+        self.insert_profile()
+        self.live_path.write_bytes(b'{"env": "live-secret\xff"}')
+
+        with self.assertRaisesRegex(
+            CcSwitchConfigError, "failed to read Claude settings file"
+        ) as raised:
+            with cc_switch_config.use_claude_profile(
+                "anyrouter", self.database.path
+            ):
+                pass
+
+        self.assertIsNone(raised.exception.__context__)
+
+        self.live_path.unlink()
+        self.live_path.mkdir()
+        with self.assertRaisesRegex(
+            CcSwitchConfigError, "failed to read Claude settings file"
+        ):
+            with cc_switch_config.use_claude_profile(
+                "anyrouter", self.database.path
+            ):
+                pass
+
+    def test_codex_provider_ignores_live_settings(self):
+        self.database.insert("codex-id", "codex", "anyrouter", CODEX_SETTINGS)
+        self.live_path.write_text("not json", "utf-8")
+
+        with use_provider("codex", "anyrouter", self.database.path) as runtime:
+            self.assertIsNone(runtime.default_effort)
 
 
 class ClaudeProfileRuntimeApiTests(unittest.TestCase):

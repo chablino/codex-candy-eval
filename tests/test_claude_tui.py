@@ -121,6 +121,7 @@ class MainTests(unittest.TestCase):
             provider_name="anyrouter",
             settings_path=self.settings_path,
             environment=self.environment,
+            default_effort=None,
         )
 
     def runtime_context(self):
@@ -166,6 +167,53 @@ class MainTests(unittest.TestCase):
         self.assertNotIn("provider-secret", run.call_args.args[0])
         manager.__enter__.assert_called_once_with()
         manager.__exit__.assert_called_once()
+
+    def launch(self, forwarded):
+        with mock.patch.object(
+            claude_tui.shutil, "which", return_value="/usr/local/bin/claude"
+        ), mock.patch.object(
+            claude_tui, "use_claude_profile", return_value=self.runtime_context()
+        ), mock.patch.object(
+            claude_tui.subprocess,
+            "run",
+            return_value=mock.Mock(returncode=0),
+        ) as run:
+            result = claude_tui.main(
+                ["--cc-switch-config", "anyrouter", "--", *forwarded]
+            )
+
+        self.assertEqual(result, 0)
+        return run.call_args.args[0]
+
+    def test_configured_effort_is_only_the_starting_level(self):
+        self.runtime.default_effort = "max"
+
+        command = self.launch(["--resume", "session-id"])
+
+        self.assertEqual(
+            command,
+            [
+                "/usr/local/bin/claude",
+                "--setting-sources",
+                "project,local",
+                "--settings",
+                str(self.settings_path),
+                "--effort",
+                "max",
+                "--resume",
+                "session-id",
+            ],
+        )
+
+    def test_forwarded_effort_replaces_configured_level(self):
+        self.runtime.default_effort = "max"
+
+        for forwarded in (["--effort", "high"], ["--effort=high"]):
+            with self.subTest(forwarded=forwarded):
+                command = self.launch(forwarded)
+
+                self.assertEqual(command[5:], forwarded)
+                self.assertNotIn("max", command)
 
     def test_prefers_cometix_over_official_claude(self):
         manager = self.runtime_context()

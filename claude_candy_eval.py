@@ -225,7 +225,8 @@ def parse_args(argv=None):
     parser.add_argument(
         "-r", "--reasoning-effort",
         choices=["low", "medium", "high", "xhigh", "max", "ultra"],
-        help="传给 claude --effort；缺省用 Claude Code 默认档位。",
+        help="传给 claude --effort；缺省时用 ~/.claude/settings.json 或 CC Switch 配置中的 "
+        "CLAUDE_CODE_EFFORT_LEVEL，未配置则用 Claude Code 默认档位。",
     )
     parser.add_argument("-n", "--tests", type=int, default=1)
     parser.add_argument(
@@ -239,6 +240,9 @@ def parse_args(argv=None):
 def _evaluate(args, use_ansi: bool, runtime) -> None:
     environment = runtime.environment if runtime is not None else None
     redactor = runtime.redact if runtime is not None else None
+    effort = args.reasoning_effort
+    if effort is None and runtime is not None:
+        effort = runtime.default_effort
 
     headers = ["Run", "Claude", "In Tok", "Out Tok", "Time(s)", "TPS", "OK"]
     aligns = ["right", "left", "right", "right", "right", "right", "center"]
@@ -248,7 +252,7 @@ def _evaluate(args, use_ansi: bool, runtime) -> None:
             start = time.perf_counter()
             text, in_tok, out_tok = run_claude(
                 args.model,
-                args.reasoning_effort,
+                effort,
                 environment=environment,
                 redact=redactor,
             )
