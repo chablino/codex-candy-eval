@@ -349,8 +349,29 @@ Config）会写入权限为 `0600` 的临时 settings 文件，同时同一份 `
 交互启动器支持包含非空 `ANTHROPIC_BASE_URL`，且仅包含
 `ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_API_KEY` 二者之一的 CC Switch 中转站配置。
 `Claude Official` 等依赖 OAuth/keychain 的配置不在支持范围内。启动器自身需要占用
-`--settings` 和 `--setting-sources`，所以不允许在转发参数中再次指定它们；
+`--settings`、`--setting-sources` 和 `--mcp-config`，所以不允许在转发参数中再次指定它们；
 `--continue`、`--resume`、`--model`、`--effort` 和权限模式等其他 Claude 参数可正常传递。
+
+provider 配置顶层的 `mcpServers`（JSON，与 `claude mcp add` 写入的格式相同）按
+provider 隔离并在任意目录生效：启动器把它单独写入临时 `mcp.json`（`0600`），通过
+`--mcp-config` 注入。Claude Code 会忽略 `--settings` 文件中的 `mcpServers`，所以不能
+像其他设置一样走 settings 文件；`--mcp-config` 是可变参数，命令行中一律使用
+`--mcp-config=<路径>` 的等号形式。已启动的窗口使用启动时的配置，增删 MCP 后需要重启
+会话。注意 `claude mcp list` 只列持久化配置，不显示 `--mcp-config` 注入的 server；
+会话内用 `/mcp` 查看连接状态。
+
+CC Switch App 4.x 把 Claude provider 的 `mcpServers` 当作全局/legacy 字段隐藏，无法
+在 App 里按 provider 管理。增删某个 Claude provider 的 MCP 请用启动器：
+
+```bash
+python3 claude_tui.py --cc-switch-config anyrouter --edit-mcp
+```
+
+编辑器里只有该 provider 的 MCP 服务器 JSON 对象：添加键以新增，删除键以移除，保存
+退出后生效。编辑器依次取 `VISUAL`、`EDITOR`，未设置时使用 `nano` 或 `vi`。保存只合并
+变化的 MCP 条目，保留凭证、模型、hooks 等其他配置；同一 MCP 被同时修改时会拒绝覆盖
+并提示重试。每次实际修改前，旧记录备份到 `~/.cc-switch/backups/claude-tui-mcp/`，
+目录权限为 `0700`，备份文件为 `0600`。
 
 评测脚本通过 selector 运行时会在启动时读取一次配置，并写入权限为 owner-only 的临时
 目录：Codex 评测使用临时 `CODEX_HOME`，Claude candy 评测使用临时

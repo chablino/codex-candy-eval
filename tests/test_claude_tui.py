@@ -97,6 +97,8 @@ class ParserTests(unittest.TestCase):
             ["--settings=/tmp/other.json"],
             ["--setting-sources", "user"],
             ["--setting-sources=user"],
+            ["--mcp-config", "/tmp/mcp.json"],
+            ["--mcp-config=/tmp/mcp.json"],
         )
         for claude_args in cases:
             with self.subTest(claude_args=claude_args), contextlib.redirect_stderr(
@@ -122,6 +124,7 @@ class MainTests(unittest.TestCase):
             settings_path=self.settings_path,
             environment=self.environment,
             default_effort=None,
+            mcp_config_path=None,
         )
 
     def runtime_context(self):
@@ -184,6 +187,18 @@ class MainTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         return run.call_args.args[0]
+
+    def test_provider_mcp_config_is_injected_with_equals_form(self):
+        self.runtime.mcp_config_path = Path("/private/tmp/claude-settings/mcp.json")
+
+        command = self.launch(["--resume", "session-id"])
+
+        settings_index = command.index(str(self.settings_path))
+        self.assertEqual(
+            command[settings_index + 1],
+            "--mcp-config=/private/tmp/claude-settings/mcp.json",
+        )
+        self.assertEqual(command[settings_index + 2 :], ["--resume", "session-id"])
 
     def test_configured_effort_is_only_the_starting_level(self):
         self.runtime.default_effort = "max"

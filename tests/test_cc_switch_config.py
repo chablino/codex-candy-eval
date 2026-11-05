@@ -834,6 +834,43 @@ class ClaudeProfileRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(shared_session.read_text(encoding="utf-8"), "shared\n")
 
+    def test_profile_mcp_servers_are_materialized_as_private_mcp_config(self):
+        self.provider.settings["mcpServers"] = {
+            "dbx": {"command": "/test/dbx-mcp", "args": ["--serve"]}
+        }
+
+        with cc_switch_config.materialize_claude_profile(self.provider) as runtime:
+            mcp_path = runtime.mcp_config_path
+            self.assertIsNotNone(mcp_path)
+            self.assertEqual(mcp_path.parent, runtime.settings_path.parent)
+            self.assertEqual(stat.S_IMODE(mcp_path.stat().st_mode), 0o600)
+            self.assertEqual(
+                json.loads(mcp_path.read_text(encoding="utf-8")),
+                {"mcpServers": {"dbx": {"command": "/test/dbx-mcp", "args": ["--serve"]}}},
+            )
+
+        self.assertFalse(mcp_path.parent.exists())
+
+    def test_profile_without_mcp_servers_has_no_mcp_config(self):
+        with cc_switch_config.materialize_claude_profile(self.provider) as runtime:
+            self.assertIsNone(runtime.mcp_config_path)
+            self.assertFalse(
+                (runtime.settings_path.parent / "mcp.json").exists()
+            )
+
+    def test_profile_rejects_invalid_mcp_servers(self):
+        for invalid in (
+            ["dbx"],
+            {"dbx": "/test/dbx-mcp"},
+        ):
+            with self.subTest(invalid=invalid):
+                self.provider.settings["mcpServers"] = invalid
+                with self.assertRaisesRegex(
+                    CcSwitchConfigError, "mcpServers"
+                ):
+                    with cc_switch_config.materialize_claude_profile(self.provider):
+                        pass
+
     def test_api_key_profile_removes_other_parent_credentials(self):
         provider = SelectedProvider(
             "claude-id",

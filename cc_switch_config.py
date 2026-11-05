@@ -57,6 +57,7 @@ class ClaudeProfileRuntime:
     settings_path: Path
     environment: Mapping[str, str] = field(repr=False)
     default_effort: str | None = None
+    mcp_config_path: Path | None = None
 
 
 def _open_read_only(db_path: Path) -> sqlite3.Connection:
@@ -621,12 +622,29 @@ def _prepare_claude_profile(
         root.chmod(0o700)
         settings_path = root / "settings.json"
         _write_private_file(settings_path, _json_document(profile_settings))
+        # Claude Code ignores mcpServers in --settings files, so provider MCP
+        # servers travel in a separate file injected via --mcp-config.
+        mcp_servers = profile_settings.get("mcpServers")
+        mcp_config_path: Path | None = None
+        if mcp_servers is not None:
+            if not isinstance(mcp_servers, dict) or any(
+                not isinstance(server, dict) for server in mcp_servers.values()
+            ):
+                raise CcSwitchConfigError(
+                    "provider mcpServers must contain server objects"
+                )
+            if mcp_servers:
+                mcp_config_path = root / "mcp.json"
+                _write_private_file(
+                    mcp_config_path, _json_document({"mcpServers": mcp_servers})
+                )
         runtime = ClaudeProfileRuntime(
             provider_id=provider.provider_id,
             provider_name=provider.name,
             settings_path=settings_path,
             environment=environment,
             default_effort=default_effort,
+            mcp_config_path=mcp_config_path,
         )
     except BaseException as exc:
         setup_error = exc
