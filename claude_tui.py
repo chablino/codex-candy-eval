@@ -30,6 +30,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="edit and save only this provider's MCP servers in VISUAL/EDITOR (default: nano/vi)",
     )
+    parser.add_argument(
+        "--reset-plugin-state",
+        action="store_true",
+        help="clear this provider's saved /plugin switches before launching",
+    )
     return parser
 
 
@@ -52,6 +57,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         arguments.claude_args = arguments.claude_args[1:]
     if arguments.edit_mcp and arguments.claude_args:
         parser.error("--edit-mcp cannot be combined with Claude arguments")
+    if arguments.edit_mcp and arguments.reset_plugin_state:
+        parser.error("--edit-mcp cannot be combined with --reset-plugin-state")
     if any(
         _is_launcher_owned_argument(argument)
         for argument in arguments.claude_args
@@ -125,7 +132,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     try:
-        with use_claude_profile(arguments.cc_switch_config) as runtime:
+        with use_claude_profile(
+            arguments.cc_switch_config,
+            reset_plugin_state=arguments.reset_plugin_state,
+        ) as runtime:
             effort_arguments = (
                 ["--effort", runtime.default_effort]
                 if runtime.default_effort is not None
@@ -143,7 +153,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 [
                     executable,
                     "--setting-sources",
-                    "project,local",
+                    "user,project,local",
                     "--settings",
                     str(runtime.settings_path),
                     *mcp_arguments,

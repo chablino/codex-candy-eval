@@ -334,17 +334,25 @@ Claude Code 还把这个环境变量当作整个会话的强制值，设置后 `
 中导出的 `CLAUDE_CODE_EFFORT_LEVEL` 不会被改动，仍会锁定整个会话。selector 评测也按同样
 规则处理：未传 `-r` 时使用这个值，传了 `-r` 则以 `-r` 为准，不会再被它悄悄覆盖。
 
-启动器只查找 `app_type=claude` 的 provider，并继续使用当前 `CLAUDE_CONFIG_DIR`（未设置时
-为 `~/.claude`），不会按 provider 隔离 sessions、history、projects、plugins 或 skills。
-因此配置 B 可以继续配置 A 创建的会话，CC Switch App 当前选择、已经运行的 Claude 窗口和
-共享 `settings.json` 都不会被修改。
+启动器只查找 `app_type=claude` 的 provider。每个窗口都有自己的临时 `CLAUDE_CONFIG_DIR`。
+除启动器生成的 settings 外，其中所有条目都以符号链接指向共享 Claude 目录（父进程的
+`CLAUDE_CONFIG_DIR`，未设置时为 `~/.claude`）；`.claude.json` 指向 Claude Code 平时使用的
+全局配置（未设置 `CLAUDE_CONFIG_DIR` 时为 `~/.claude.json`）。sessions、history、projects、
+插件缓存、用户级 skills/agents/commands 和 `CLAUDE.md` 仍跨 provider 共享，所以配置 B
+可以继续配置 A 创建的会话。CC Switch App 当前选择、已经运行的 Claude 窗口和共享
+`settings.json` 都不会被修改。会话中新建、且共享目录里还没有的状态，会在退出时移回
+共享目录。子进程设置了 `CLAUDE_SECURESTORAGE_CONFIG_DIR`，钥匙串中的凭证条目名与直接
+运行 Claude Code 时相同。
 
-CC Switch 所选 provider 的完整配置（包括顶层 `env`，以及按上述规则合并的 Common
-Config）会写入权限为 `0600` 的临时 settings 文件，同时同一份 `env` 会注入 Claude 子进程。启动命令固定使用
-`--setting-sources project,local` 保留正常的项目和 local settings，并通过优先级更高的
+CC Switch 所选 provider 的配置（包括顶层 `env`，以及按上述规则合并的 Common Config，
+`enabledPlugins` 除外）会写入权限为 `0600` 的临时 `provider-settings.json`，同时同一份
+`env` 会注入 Claude 子进程。启动命令固定使用 `--setting-sources user,project,local`：
+user 来源读取的是本窗口自己的 `settings.json`，其中只有下文的插件开关，所以共享
+`~/.claude/settings.json` 的其他内容仍不生效；项目和 local settings 照常读取；优先级更高的
 `--settings` 确保指定 provider 的地址、凭证、模型映射和自定义 headers 最终生效。临时目录
-权限为 `0700`，token、地址和 headers 不会进入命令行、日志或公开错误；临时 settings
-仅在 Claude 进程运行期间存在，正常退出、异常、Ctrl-C 或 SIGTERM 后都会清理。
+权限为 `0700`，token、地址和 headers 不会进入命令行、日志或公开错误；临时目录仅在 Claude
+进程运行期间存在，正常退出、异常、Ctrl-C 或 SIGTERM 后都会清理。清理只删除链接，不会删除
+共享目录中的内容。
 
 交互启动器支持包含非空 `ANTHROPIC_BASE_URL`，且仅包含
 `ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_API_KEY` 二者之一的 CC Switch 中转站配置。
@@ -382,6 +390,39 @@ CLI，不会切换或写入 App 当前配置，也不会修改默认的 `~/.code
 selector 模式目前只支持 macOS/Linux。原有不带 selector 的命令在 Windows 和
 `curl/wget | python` 单文件模式下保持可用；管道模式若要指定配置，请先克隆完整仓库，
 因为共享的只读配置模块不随单个脚本下载。
+
+### 按 provider 开关 Claude 插件
+
+在启动器窗口中用 `/plugin` 启用或禁用插件，再运行 `/reload-plugins`，即可当场生效。
+正常退出时，这些变化只为当前 provider 保存，下次启动该 provider 时继续生效，其他 provider
+不受影响。例如，在 `ultrarouter` 窗口中禁用 superpowers 并退出后，`ultrarouter` 以后都
+不再加载它，`linxi` 仍按 Common Config 加载。
+
+插件开关的优先级从低到高依次为：provider 配置的 `enabledPlugins`、开启
+`Apply Common Config` 时的 Common Config、该 provider 通过 `/plugin` 保存的开关。保存位置
+是共享 Claude 目录下的 `.cc-switch-tui/provider-plugins/`。这里只记录与前两层不同的项，改回
+默认值后自动删除；不写 CC Switch 数据库，也不写 `~/.claude/settings.json`。多个窗口退出时
+只合并各自实际改动的插件，未操作插件的窗口不会覆盖其他窗口的选择。开关在退出时才保存，
+对已经在运行的其他窗口不生效。
+
+要清除某个 provider 保存的插件开关、回到 provider 配置与 Common Config 的默认值：
+
+```bash
+python3 claude_tui.py --cc-switch-config ultrarouter --reset-plugin-state
+```
+
+插件的安装和卸载仍是全局的。卸载会清除所有 provider 保存的启用记录；如果当前 provider
+的默认值是启用，还会为它保存一条禁用记录。只要还有某个 provider 的默认值启用该插件，以该
+provider 启动时 Claude Code 就会自动重新安装它；要对所有 provider 停用某个插件，请从
+Common Config 中删除它。
+
+窗口中修改的其他用户级设置（例如 `/theme`、`/statusline` 或 `/model` 的默认值）只对当前
+窗口有效，退出后丢弃。用户级 skills、agents、commands 和 `CLAUDE.md` 与直接运行 Claude
+Code 时一样加载。
+
+Claude Code 修改 `.claude.json` 时使用的锁文件位于各窗口自己的临时目录，所以多个启动器
+窗口之间、以及它们与直接运行的 Claude Code 之间，不再共用这把锁。几个窗口在同一瞬间写入
+时，后写入者可能覆盖先写入者刚做的改动，例如项目信任状态或统计字段。
 
 ### 一键运行
 以下任选其一

@@ -109,6 +109,25 @@ class ParserTests(unittest.TestCase):
                         ["--cc-switch-config", "anyrouter", "--", *claude_args]
                     )
 
+    def test_reset_plugin_state_defaults_off(self):
+        arguments = claude_tui.parse_args(["--cc-switch-config", "anyrouter"])
+
+        self.assertFalse(arguments.reset_plugin_state)
+
+    def test_reset_plugin_state_cannot_be_combined_with_edit_mcp(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                claude_tui.parse_args(
+                    [
+                        "--cc-switch-config",
+                        "anyrouter",
+                        "--edit-mcp",
+                        "--reset-plugin-state",
+                    ]
+                )
+
+        self.assertEqual(raised.exception.code, 2)
+
 
 class MainTests(unittest.TestCase):
     def setUp(self):
@@ -155,12 +174,12 @@ class MainTests(unittest.TestCase):
         self.assertEqual(
             which.call_args_list, [mock.call("cometix"), mock.call("claude")]
         )
-        use_profile.assert_called_once_with("anyrouter")
+        use_profile.assert_called_once_with("anyrouter", reset_plugin_state=False)
         run.assert_called_once_with(
             [
                 "/usr/local/bin/claude",
                 "--setting-sources",
-                "project,local",
+                "user,project,local",
                 "--settings",
                 str(self.settings_path),
                 *forwarded,
@@ -210,7 +229,7 @@ class MainTests(unittest.TestCase):
             [
                 "/usr/local/bin/claude",
                 "--setting-sources",
-                "project,local",
+                "user,project,local",
                 "--settings",
                 str(self.settings_path),
                 "--effort",
@@ -272,12 +291,32 @@ class MainTests(unittest.TestCase):
             [
                 "/bin/claude",
                 "--setting-sources",
-                "project,local",
+                "user,project,local",
                 "--settings",
                 str(self.settings_path),
             ],
             env=self.environment,
         )
+
+    def test_reset_plugin_state_is_passed_to_the_profile(self):
+        manager = self.runtime_context()
+
+        with mock.patch.object(
+            claude_tui.shutil, "which", return_value="/bin/claude"
+        ), mock.patch.object(
+            claude_tui, "use_claude_profile", return_value=manager
+        ) as use_profile, mock.patch.object(
+            claude_tui.subprocess,
+            "run",
+            return_value=mock.Mock(returncode=0),
+        ) as run:
+            result = claude_tui.main(
+                ["--cc-switch-config", "anyrouter", "--reset-plugin-state"]
+            )
+
+        self.assertEqual(result, 0)
+        use_profile.assert_called_once_with("anyrouter", reset_plugin_state=True)
+        self.assertNotIn("--reset-plugin-state", run.call_args.args[0])
 
     def test_missing_claude_returns_two_before_provider_selection(self):
         stderr = io.StringIO()
