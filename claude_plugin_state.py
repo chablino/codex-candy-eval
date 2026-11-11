@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import tempfile
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -15,6 +16,11 @@ from typing import Any
 
 
 STATE_DIRECTORY_NAME = ".cc-switch-tui"
+OVERLAY_PREFIX = "codex-candy-eval-claude-"
+_INSTALL_RECORDS = (
+    ("installed_plugins.json", "installPath"),
+    ("known_marketplaces.json", "installLocation"),
+)
 _RESET_HINT = "; use --reset-plugin-state to clear it"
 
 
@@ -314,3 +320,110 @@ class ClaudePluginStateStore:
                     self._write_sidecar(path, stored_id, updated)
                 else:
                     self._remove_file(path)
+
+
+def _install_records(name: str, document: object) -> list[dict[str, Any]]:
+    if not isinstance(document, dict):
+        return []
+    if name == "installed_plugins.json":
+        plugins = document.get("plugins")
+        entries = plugins.values() if isinstance(plugins, dict) else []
+        return [
+            record
+            for entry in entries
+            if isinstance(entry, list)
+            for record in entry
+            if isinstance(record, dict)
+        ]
+    return [record for record in document.values() if isinstance(record, dict)]
+
+
+def _replace_json_if_unchanged(
+    path: Path, document: object, before: os.stat_result
+) -> bool:
+    """Atomically replace path unless another process wrote it since before."""
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary_path: Path | None = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, stat.S_IMODE(before.st_mode))
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as output:
+            descriptor = -1
+            output.write(json.dumps(document, ensure_ascii=False, indent=2))
+            output.flush()
+            os.fsync(output.fileno())
+        current = path.stat()
+        if (current.st_mtime_ns, current.st_size) != (
+            before.st_mtime_ns,
+            before.st_size,
+        ):
+            return False
+        os.replace(temporary_path, path)
+        temporary_path = None
+        _fsync_directory(path.parent)
+        return True
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def repair_install_paths(
+    shared_home: Path,
+    temporary_root: Path,
+    *,
+    active_overlay: Path | None = None,
+) -> int:
+    """Point plugin install records made inside launcher overlays at shared_home.
+
+    Claude Code records absolute paths under its config directory, which is
+    the overlay in launcher windows. With active_overlay only that window's
+    records are rewritten. Without it, records of overlays that no longer
+    exist are rewritten when the shared copy exists, which recovers windows
+    that never finalized. Unreadable records are left alone.
+    """
+    roots = {str(temporary_root)}
+    try:
+        roots.add(str(temporary_root.resolve()))
+    except (OSError, RuntimeError):
+        pass
+
+    def rewrite(value: str) -> str | None:
+        for root in roots:
+            prefix = root.rstrip(os.sep) + os.sep
+            if not value.startswith(prefix):
+                continue
+            overlay_name, _, relative = value[len(prefix) :].partition(os.sep)
+            if not overlay_name.startswith(OVERLAY_PREFIX) or not relative:
+                return None
+            if active_overlay is not None:
+                if overlay_name != active_overlay.name:
+                    return None
+            elif os.path.lexists(os.path.join(root, overlay_name)):
+                return None
+            shared_path = shared_home / relative
+            return str(shared_path) if shared_path.exists() else None
+        return None
+
+    rewritten = 0
+    for name, key in _INSTALL_RECORDS:
+        path = shared_home / "plugins" / name
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            before = path.stat()
+            document = json.loads(path.read_text(encoding="utf-8"))
+            count = 0
+            for record in _install_records(name, document):
+                value = record.get(key)
+                replacement = rewrite(value) if isinstance(value, str) else None
+                if replacement is not None:
+                    record[key] = replacement
+                    count += 1
+            if count and _replace_json_if_unchanged(path, document, before):
+                rewritten += count
+        except (OSError, UnicodeDecodeError, ValueError, RecursionError):
+            continue
+    return rewritten
