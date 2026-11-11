@@ -8,18 +8,37 @@ import re
 import signal
 import sqlite3
 import tempfile
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
+from claude_overlay import (
+    GLOBAL_CONFIG_NAME,
+    ClaudeOverlayError,
+    link_shared_entries,
+    reclaim_overlay_entries,
+)
+from claude_plugin_state import (
+    OVERLAY_PREFIX,
+    ClaudePluginStateError,
+    ClaudePluginStateStore,
+    RuntimeSnapshot,
+    effective_plugins,
+    enabled_view,
+    read_installed_plugins,
+    repair_install_paths,
+)
+
 
 AppType = Literal["codex", "claude"]
 
 DEFAULT_DB_PATH = Path.home() / ".cc-switch" / "cc-switch.db"
 CLAUDE_LIVE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+CLAUDE_DEFAULT_HOME = Path.home() / ".claude"
+CLAUDE_DEFAULT_GLOBAL_CONFIG = Path.home() / ".claude.json"
 REQUIRED_PROVIDER_COLUMNS = frozenset(
     {"id", "app_type", "name", "settings_config", "meta"}
 )
@@ -55,6 +74,7 @@ class ClaudeProfileRuntime:
     provider_id: str
     provider_name: str
     settings_path: Path
+    config_home: Path
     environment: Mapping[str, str] = field(repr=False)
     default_effort: str | None = None
     mcp_config_path: Path | None = None
@@ -598,11 +618,64 @@ def _claude_profile_parts(
     return settings, provider_environment
 
 
+_SECURE_STORAGE_ENV_KEY = "CLAUDE_SECURESTORAGE_CONFIG_DIR"
+
+
+@dataclass(frozen=True)
+class _PreparedClaudeProfile:
+    temporary_directory: tempfile.TemporaryDirectory[str]
+    runtime: ClaudeProfileRuntime
+    shared_home: Path
+    state_store: ClaudePluginStateStore
+    baseline_plugins: dict[str, Any]
+    initial_snapshot: RuntimeSnapshot
+
+
+def _claude_shared_home(configured: str | None) -> tuple[Path, Path]:
+    """Return the shared Claude home and the global config Claude pairs with it."""
+    failed = False
+    home = global_config = Path()
+    try:
+        if configured:
+            home = Path(configured)
+            global_config = home / GLOBAL_CONFIG_NAME
+            failed = not home.is_dir()
+        else:
+            home = CLAUDE_DEFAULT_HOME
+            global_config = CLAUDE_DEFAULT_GLOBAL_CONFIG
+            home.mkdir(mode=0o700, exist_ok=True)
+    except OSError:
+        failed = True
+    if failed:
+        raise CcSwitchConfigError(
+            "Claude config directory (CLAUDE_CONFIG_DIR or ~/.claude) "
+            "must be a directory"
+        )
+    return home, global_config
+
+
+def _read_window_plugins(settings_path: Path) -> dict[str, bool] | None:
+    """Read a window's plugin switches, or None when they cannot be trusted."""
+    try:
+        document = json.loads(
+            settings_path.read_text(encoding="utf-8"),
+            parse_constant=_reject_json_constant,
+        )
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError):
+        return None
+    plugins = (
+        document.get("enabledPlugins", {}) if isinstance(document, dict) else None
+    )
+    if not isinstance(plugins, dict):
+        return None
+    return enabled_view(plugins)
+
+
 def _prepare_claude_profile(
-    provider: SelectedProvider,
-) -> tuple[tempfile.TemporaryDirectory[str], ClaudeProfileRuntime]:
+    provider: SelectedProvider, *, reset_plugin_state: bool = False
+) -> _PreparedClaudeProfile:
     temporary_directory: tempfile.TemporaryDirectory[str] | None = None
-    runtime: ClaudeProfileRuntime | None = None
+    prepared: _PreparedClaudeProfile | None = None
     setup_error: BaseException | None = None
 
     try:
@@ -610,41 +683,83 @@ def _prepare_claude_profile(
         # provider_environment is profile_settings["env"], so the level leaves
         # both the settings file and the child environment.
         default_effort = _take_claude_default_effort(profile_settings)
+        # Plugin switches live in the window's own settings so /plugin can
+        # change them; flag settings would override every /plugin change.
+        baseline_plugins = profile_settings.pop("enabledPlugins", {})
+        if not isinstance(baseline_plugins, dict) or any(
+            not isinstance(plugin_id, str) for plugin_id in baseline_plugins
+        ):
+            raise CcSwitchConfigError("provider enabledPlugins must be an object")
+        mcp_servers = profile_settings.get("mcpServers")
+        if mcp_servers is not None and (
+            not isinstance(mcp_servers, dict)
+            or any(not isinstance(server, dict) for server in mcp_servers.values())
+        ):
+            raise CcSwitchConfigError(
+                "provider mcpServers must contain server objects"
+            )
+
+        configured_home = os.environ.get("CLAUDE_CONFIG_DIR")
+        shared_home, global_config = _claude_shared_home(configured_home)
         environment = os.environ.copy()
         for key in _CLAUDE_PARENT_AUTH_KEYS:
             environment.pop(key, None)
         environment.update(provider_environment)
+        if _SECURE_STORAGE_ENV_KEY not in environment:
+            # Keep keychain entry names: Claude Code adds no suffix for an
+            # empty value and otherwise hashes the configured directory.
+            environment[_SECURE_STORAGE_ENV_KEY] = configured_home or ""
 
-        temporary_directory = tempfile.TemporaryDirectory(
-            prefix="codex-candy-eval-claude-"
+        state_store = ClaudePluginStateStore(shared_home)
+        if reset_plugin_state:
+            state_store.reset_provider(provider.provider_id)
+        effective = effective_plugins(
+            baseline_plugins,
+            state_store.load_provider_plugins(provider.provider_id),
         )
+        try:
+            with state_store.lock():
+                repair_install_paths(shared_home, Path(tempfile.gettempdir()))
+        except ClaudePluginStateError:
+            pass  # Best effort: stale records only affect which plugins load.
+
+        temporary_directory = tempfile.TemporaryDirectory(prefix=OVERLAY_PREFIX)
         root = Path(temporary_directory.name)
         root.chmod(0o700)
-        settings_path = root / "settings.json"
+        link_shared_entries(root, shared_home, global_config)
+        _write_private_file(
+            root / "settings.json", _json_document({"enabledPlugins": effective})
+        )
+        settings_path = root / "provider-settings.json"
         _write_private_file(settings_path, _json_document(profile_settings))
         # Claude Code ignores mcpServers in --settings files, so provider MCP
         # servers travel in a separate file injected via --mcp-config.
-        mcp_servers = profile_settings.get("mcpServers")
         mcp_config_path: Path | None = None
-        if mcp_servers is not None:
-            if not isinstance(mcp_servers, dict) or any(
-                not isinstance(server, dict) for server in mcp_servers.values()
-            ):
-                raise CcSwitchConfigError(
-                    "provider mcpServers must contain server objects"
-                )
-            if mcp_servers:
-                mcp_config_path = root / "mcp.json"
-                _write_private_file(
-                    mcp_config_path, _json_document({"mcpServers": mcp_servers})
-                )
+        if mcp_servers:
+            mcp_config_path = root / "mcp.json"
+            _write_private_file(
+                mcp_config_path, _json_document({"mcpServers": mcp_servers})
+            )
+        environment["CLAUDE_CONFIG_DIR"] = str(root)
         runtime = ClaudeProfileRuntime(
             provider_id=provider.provider_id,
             provider_name=provider.name,
             settings_path=settings_path,
+            config_home=root,
             environment=environment,
             default_effort=default_effort,
             mcp_config_path=mcp_config_path,
+        )
+        prepared = _PreparedClaudeProfile(
+            temporary_directory=temporary_directory,
+            runtime=runtime,
+            shared_home=shared_home,
+            state_store=state_store,
+            baseline_plugins=baseline_plugins,
+            initial_snapshot=RuntimeSnapshot(
+                enabled_view(effective),
+                read_installed_plugins(shared_home / "plugins"),
+            ),
         )
     except BaseException as exc:
         setup_error = exc
@@ -656,32 +771,85 @@ def _prepare_claude_profile(
             raise setup_error
         if isinstance(setup_error, CcSwitchConfigError):
             raise setup_error
+        if isinstance(setup_error, (ClaudePluginStateError, ClaudeOverlayError)):
+            # Their messages are fixed text, so they are safe to show.
+            raise CcSwitchConfigError(str(setup_error))
         raise CcSwitchConfigError(
             "failed to materialize selected Claude profile"
         )
 
-    assert temporary_directory is not None
-    assert runtime is not None
-    return temporary_directory, runtime
+    assert prepared is not None
+    return prepared
+
+
+def _synchronize_claude_plugins(prepared: _PreparedClaudeProfile) -> None:
+    final_plugins = _read_window_plugins(
+        prepared.runtime.config_home / "settings.json"
+    )
+    if final_plugins is None:
+        raise CcSwitchConfigError("Claude plugin switches could not be read")
+    prepared.state_store.apply_runtime_changes(
+        prepared.runtime.provider_id,
+        prepared.baseline_plugins,
+        prepared.initial_snapshot,
+        RuntimeSnapshot(
+            final_plugins, read_installed_plugins(prepared.shared_home / "plugins")
+        ),
+    )
+
+
+def _repair_claude_install_paths(prepared: _PreparedClaudeProfile) -> None:
+    with prepared.state_store.lock():
+        repair_install_paths(
+            prepared.shared_home,
+            Path(tempfile.gettempdir()),
+            active_overlay=prepared.runtime.config_home,
+        )
+
+
+def _reclaim_claude_window(prepared: _PreparedClaudeProfile) -> None:
+    reclaim_overlay_entries(prepared.runtime.config_home, prepared.shared_home)
+
+
+def _finalize_step(
+    step: Callable[[_PreparedClaudeProfile], None],
+    prepared: _PreparedClaudeProfile,
+) -> bool:
+    try:
+        step(prepared)
+    except BaseException:
+        return False
+    return True
 
 
 @contextmanager
 def materialize_claude_profile(
-    provider: SelectedProvider,
+    provider: SelectedProvider, *, reset_plugin_state: bool = False
 ) -> Iterator[ClaudeProfileRuntime]:
-    """Overlay one Claude provider without replacing shared Claude state."""
-    temporary_directory, runtime = _prepare_claude_profile(provider)
+    """Run one Claude provider in its own config directory over shared state."""
+    prepared = _prepare_claude_profile(
+        provider, reset_plugin_state=reset_plugin_state
+    )
     body_failed = False
     try:
-        yield runtime
+        yield prepared.runtime
     except BaseException:
         body_failed = True
         raise
     finally:
-        cleanup_succeeded = _cleanup_temporary_directory(temporary_directory)
-        if not body_failed and not cleanup_succeeded:
+        finalized = all(
+            [
+                _finalize_step(_synchronize_claude_plugins, prepared),
+                _finalize_step(_repair_claude_install_paths, prepared),
+                _finalize_step(_reclaim_claude_window, prepared),
+            ]
+        )
+        cleanup_succeeded = _cleanup_temporary_directory(
+            prepared.temporary_directory
+        )
+        if not body_failed and not (finalized and cleanup_succeeded):
             raise CcSwitchConfigError(
-                "failed to clean up selected Claude profile"
+                "failed to finalize selected Claude profile"
             )
 
 
@@ -733,6 +901,8 @@ def use_provider(
 def use_claude_profile(
     selector: str,
     db_path: str | Path = DEFAULT_DB_PATH,
+    *,
+    reset_plugin_state: bool = False,
 ) -> Iterator[ClaudeProfileRuntime]:
     """Select one Claude provider while preserving shared Claude state."""
     if os.name == "nt":
@@ -746,7 +916,9 @@ def use_claude_profile(
         )
     )
     with _sigterm_as_system_exit():
-        with materialize_claude_profile(provider) as runtime:
+        with materialize_claude_profile(
+            provider, reset_plugin_state=reset_plugin_state
+        ) as runtime:
             yield runtime
 
 

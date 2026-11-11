@@ -24,6 +24,7 @@ from cc_switch_config import (
     redact_text,
     use_provider,
 )
+from claude_plugin_state import ClaudePluginStateStore, RuntimeSnapshot
 
 
 # Claude runtimes read this file on every launch, so keep tests off the real one.
@@ -32,14 +33,36 @@ _LIVE_SETTINGS_PATCH = mock.patch.object(
     "CLAUDE_LIVE_SETTINGS_PATH",
     Path("/nonexistent/claude/settings.json"),
 )
+# Claude profiles link a shared home into each window; never use the real one.
+_CLAUDE_HOME_DIRECTORY = tempfile.TemporaryDirectory()
+_CLAUDE_HOME_PATCHES = (
+    mock.patch.object(
+        cc_switch_config,
+        "CLAUDE_DEFAULT_HOME",
+        Path(_CLAUDE_HOME_DIRECTORY.name) / ".claude",
+    ),
+    mock.patch.object(
+        cc_switch_config,
+        "CLAUDE_DEFAULT_GLOBAL_CONFIG",
+        Path(_CLAUDE_HOME_DIRECTORY.name) / ".claude.json",
+    ),
+    mock.patch.dict(os.environ),
+)
 
 
 def setUpModule():
     _LIVE_SETTINGS_PATCH.start()
+    for patcher in _CLAUDE_HOME_PATCHES:
+        patcher.start()
+    for key in ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR"):
+        os.environ.pop(key, None)
 
 
 def tearDownModule():
+    for patcher in reversed(_CLAUDE_HOME_PATCHES):
+        patcher.stop()
     _LIVE_SETTINGS_PATCH.stop()
+    _CLAUDE_HOME_DIRECTORY.cleanup()
 
 
 CODEX_SETTINGS = {
@@ -69,6 +92,12 @@ CLAUDE_PROFILE_SETTINGS = {
     "model": "sonnet",
     "effortLevel": "high",
     "enabledPlugins": {"example@marketplace": True},
+}
+# The provider settings file leaves plugin switches to the window's settings.
+CLAUDE_PROVIDER_FILE_SETTINGS = {
+    key: value
+    for key, value in CLAUDE_PROFILE_SETTINGS.items()
+    if key != "enabledPlugins"
 }
 
 
@@ -776,7 +805,7 @@ class ClaudeProfileRuntimeTests(unittest.TestCase):
                 self.assertTrue(runtime.settings_path.is_file())
                 settings_text = runtime.settings_path.read_text(encoding="utf-8")
                 settings = json.loads(settings_text)
-                self.assertEqual(settings, CLAUDE_PROFILE_SETTINGS)
+                self.assertEqual(settings, CLAUDE_PROVIDER_FILE_SETTINGS)
                 self.assertEqual(
                     settings["env"]["ANTHROPIC_AUTH_TOKEN"],
                     "claude-profile-secret",
@@ -791,7 +820,7 @@ class ClaudeProfileRuntimeTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     runtime.environment["CLAUDE_CONFIG_DIR"],
-                    str(self.claude_home),
+                    str(runtime.config_home),
                 )
                 self.assertEqual(
                     runtime.environment["ANTHROPIC_BASE_URL"],
@@ -1225,7 +1254,7 @@ class ClaudeProfileRuntimeTests(unittest.TestCase):
             current_handler["value"] = handler
 
         @contextmanager
-        def interrupt_during_materialization(provider):
+        def interrupt_during_materialization(provider, **_options):
             materialized_providers.append(provider)
             current_handler["value"](signal.SIGTERM, None)
             yield  # pragma: no cover
@@ -1322,6 +1351,9 @@ class ClaudeCommonConfigTests(unittest.TestCase):
             "anyrouter", self.database.path
         ) as runtime:
             settings = json.loads(runtime.settings_path.read_text("utf-8"))
+            window = json.loads(
+                (runtime.config_home / "settings.json").read_text("utf-8")
+            )
 
         self.assertEqual(
             settings["env"],
@@ -1330,9 +1362,15 @@ class ClaudeCommonConfigTests(unittest.TestCase):
         # Like the CC Switch App, Common Config wins on conflicting values.
         self.assertEqual(settings["model"], "opus")
         self.assertEqual(settings["effortLevel"], "high")
+        self.assertNotIn("enabledPlugins", settings)
         self.assertEqual(
-            settings["enabledPlugins"],
-            {"example@marketplace": True, "common@marketplace": True},
+            window,
+            {
+                "enabledPlugins": {
+                    "example@marketplace": True,
+                    "common@marketplace": True,
+                }
+            },
         )
         self.assertEqual(runtime.environment["DISABLE_AUTOUPDATER"], "1")
         self.assertEqual(runtime.default_effort, "max")
@@ -1353,7 +1391,7 @@ class ClaudeCommonConfigTests(unittest.TestCase):
                         runtime.settings_path.read_text("utf-8")
                     )
 
-                self.assertEqual(settings, CLAUDE_PROFILE_SETTINGS)
+                self.assertEqual(settings, CLAUDE_PROVIDER_FILE_SETTINGS)
                 self.assertNotIn("DISABLE_AUTOUPDATER", runtime.environment)
 
     def test_selector_eval_runtime_also_merges_common_config(self):
@@ -1379,7 +1417,7 @@ class ClaudeCommonConfigTests(unittest.TestCase):
         ) as runtime:
             settings = json.loads(runtime.settings_path.read_text("utf-8"))
 
-        self.assertEqual(settings, CLAUDE_PROFILE_SETTINGS)
+        self.assertEqual(settings, CLAUDE_PROVIDER_FILE_SETTINGS)
 
     def test_invalid_common_config_is_rejected_without_leaking_payload(self):
         self.insert_profile(True)
@@ -1613,7 +1651,7 @@ class ClaudeLiveEffortTests(unittest.TestCase):
         ) as runtime:
             settings = json.loads(runtime.settings_path.read_text("utf-8"))
 
-        self.assertEqual(settings, CLAUDE_PROFILE_SETTINGS)
+        self.assertEqual(settings, CLAUDE_PROVIDER_FILE_SETTINGS)
         self.assertNotIn("LIVE_ONLY", runtime.environment)
 
     def test_applying_live_level_leaves_provider_unchanged(self):
@@ -1680,6 +1718,254 @@ class ClaudeLiveEffortTests(unittest.TestCase):
 
         with use_provider("codex", "anyrouter", self.database.path) as runtime:
             self.assertIsNone(runtime.default_effort)
+
+
+class ClaudeProfilePluginTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.shared = self.root / "claude-home"
+        self.shared.mkdir()
+        self.provider = SelectedProvider(
+            "claude-id", "claude", "anyrouter", deepcopy(CLAUDE_PROFILE_SETTINGS)
+        )
+        environment = mock.patch.dict(
+            os.environ, {"CLAUDE_CONFIG_DIR": str(self.shared)}, clear=True
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        self.store = ClaudePluginStateStore(self.shared)
+
+    def window(self, runtime):
+        return json.loads((runtime.config_home / "settings.json").read_text("utf-8"))
+
+    def test_window_runs_in_its_own_config_directory(self):
+        (self.shared / "projects").mkdir()
+        (self.shared / "settings.json").write_text('{"model":"shared"}\n', "utf-8")
+
+        with cc_switch_config.materialize_claude_profile(self.provider) as runtime:
+            home = runtime.config_home
+            self.assertNotEqual(home, self.shared)
+            self.assertEqual(runtime.environment["CLAUDE_CONFIG_DIR"], str(home))
+            self.assertEqual(runtime.settings_path, home / "provider-settings.json")
+            self.assertEqual(
+                json.loads(runtime.settings_path.read_text("utf-8")),
+                CLAUDE_PROVIDER_FILE_SETTINGS,
+            )
+            self.assertEqual(
+                self.window(runtime),
+                {"enabledPlugins": {"example@marketplace": True}},
+            )
+            self.assertEqual(
+                stat.S_IMODE((home / "settings.json").stat().st_mode), 0o600
+            )
+            self.assertEqual(
+                os.readlink(home / "projects"), str(self.shared / "projects")
+            )
+            self.assertEqual(
+                os.readlink(home / ".claude.json"), str(self.shared / ".claude.json")
+            )
+            self.assertEqual(
+                runtime.environment["CLAUDE_SECURESTORAGE_CONFIG_DIR"],
+                str(self.shared),
+            )
+
+        self.assertFalse(home.exists())
+        self.assertTrue((self.shared / "projects").is_dir())
+        self.assertEqual(
+            (self.shared / "settings.json").read_text("utf-8"),
+            '{"model":"shared"}\n',
+        )
+
+    def test_default_home_and_keychain_names_match_plain_claude(self):
+        user_home = self.root / "user-home"
+        user_home.mkdir()
+        default_home = user_home / ".claude"
+        global_config = user_home / ".claude.json"
+
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            cc_switch_config, "CLAUDE_DEFAULT_HOME", default_home
+        ), mock.patch.object(
+            cc_switch_config, "CLAUDE_DEFAULT_GLOBAL_CONFIG", global_config
+        ):
+            with cc_switch_config.materialize_claude_profile(
+                self.provider
+            ) as runtime:
+                self.assertTrue(default_home.is_dir())
+                self.assertEqual(
+                    os.readlink(runtime.config_home / ".claude.json"),
+                    str(global_config),
+                )
+                self.assertEqual(
+                    os.readlink(runtime.config_home / "projects"),
+                    str(default_home / "projects"),
+                )
+                self.assertEqual(
+                    runtime.environment["CLAUDE_SECURESTORAGE_CONFIG_DIR"], ""
+                )
+
+    def test_existing_keychain_setting_is_kept(self):
+        os.environ["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = "/custom/storage"
+
+        with cc_switch_config.materialize_claude_profile(self.provider) as runtime:
+            self.assertEqual(
+                runtime.environment["CLAUDE_SECURESTORAGE_CONFIG_DIR"],
+                "/custom/storage",
+            )
+
+    def test_missing_configured_home_is_rejected_before_window_creation(self):
+        os.environ["CLAUDE_CONFIG_DIR"] = str(self.root / "missing")
+
+        with mock.patch.object(
+            cc_switch_config.tempfile, "TemporaryDirectory"
+        ) as temporary_directory:
+            with self.assertRaisesRegex(CcSwitchConfigError, "CLAUDE_CONFIG_DIR"):
+                with cc_switch_config.materialize_claude_profile(self.provider):
+                    pass
+
+        temporary_directory.assert_not_called()
+
+    def test_saved_switch_overrides_baseline(self):
+        baseline = {"example@marketplace": True}
+        self.store.apply_runtime_changes(
+            "claude-id",
+            baseline,
+            RuntimeSnapshot(baseline, frozenset()),
+            RuntimeSnapshot({"example@marketplace": False}, frozenset()),
+        )
+
+        with cc_switch_config.materialize_claude_profile(self.provider) as runtime:
+            self.assertEqual(
+                self.window(runtime),
+                {"enabledPlugins": {"example@marketplace": False}},
+            )
+
+    def test_switch_changed_in_window_is_saved_for_provider_only(self):
+        with cc_switch_config.materialize_claude_profile(self.provider) as runtime:
+            (runtime.config_home / "settings.json").write_text(
+                json.dumps(
+                    {
+                        "enabledPlugins": {
+                            "example@marketplace": False,
+                            "new@marketplace": True,
+                        },
+                        "theme": "light",
+                    }
+                ),
+                "utf-8",
+            )
+
+        self.assertEqual(
+            self.store.load_provider_plugins("claude-id"),
+            {"example@marketplace": False, "new@marketplace": True},
+        )
+        self.assertEqual(self.store.load_provider_plugins("other-id"), {})
+        self.assertFalse((self.shared / "settings.json").exists())
+
+    def test_unreadable_window_switches_save_nothing(self):
+        for damage in ("corrupt", "missing"):
+            with self.subTest(damage=damage):
+                with self.assertRaisesRegex(
+                    CcSwitchConfigError, "failed to finalize"
+                ):
+                    with cc_switch_config.materialize_claude_profile(
+                        self.provider
+                    ) as runtime:
+                        window_settings = runtime.config_home / "settings.json"
+                        if damage == "corrupt":
+                            window_settings.write_text("{", "utf-8")
+                        else:
+                            window_settings.unlink()
+
+                self.assertEqual(self.store.load_provider_plugins("claude-id"), {})
+
+    def test_corrupt_saved_state_needs_reset(self):
+        sidecar = self.store._sidecar_path("claude-id")
+        sidecar.parent.mkdir(parents=True)
+        sidecar.write_text("{", "utf-8")
+
+        with self.assertRaises(CcSwitchConfigError) as raised:
+            with cc_switch_config.materialize_claude_profile(self.provider):
+                pass
+
+        self.assertIn("--reset-plugin-state", str(raised.exception))
+        self.assertIsNone(raised.exception.__context__)
+
+        with cc_switch_config.materialize_claude_profile(
+            self.provider, reset_plugin_state=True
+        ) as runtime:
+            self.assertEqual(
+                self.window(runtime),
+                {"enabledPlugins": {"example@marketplace": True}},
+            )
+        self.assertFalse(sidecar.exists())
+
+    def test_invalid_provider_plugin_switches_are_rejected(self):
+        self.provider.settings["enabledPlugins"] = ["example@marketplace"]
+
+        with self.assertRaisesRegex(CcSwitchConfigError, "enabledPlugins"):
+            with cc_switch_config.materialize_claude_profile(self.provider):
+                pass
+
+    def test_install_records_made_in_window_point_at_shared_home(self):
+        cache = self.shared / "plugins" / "cache" / "mkt" / "demo" / "1.0.0"
+        record = self.shared / "plugins" / "installed_plugins.json"
+
+        with cc_switch_config.materialize_claude_profile(self.provider) as runtime:
+            cache.mkdir(parents=True)
+            record.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "plugins": {
+                            "demo@mkt": [
+                                {
+                                    "installPath": str(
+                                        runtime.config_home
+                                        / "plugins/cache/mkt/demo/1.0.0"
+                                    )
+                                }
+                            ]
+                        },
+                    }
+                ),
+                "utf-8",
+            )
+
+        installed = json.loads(record.read_text("utf-8"))
+        self.assertEqual(
+            installed["plugins"]["demo@mkt"][0]["installPath"], str(cache)
+        )
+
+    def test_state_created_in_window_is_kept_in_shared_home(self):
+        with cc_switch_config.materialize_claude_profile(self.provider) as runtime:
+            (runtime.config_home / "statsig").mkdir()
+            (runtime.config_home / "statsig" / "id").write_text("kept", "utf-8")
+
+        self.assertEqual(
+            (self.shared / "statsig" / "id").read_text("utf-8"), "kept"
+        )
+
+    def test_use_claude_profile_passes_reset_through(self):
+        calls = []
+
+        @contextmanager
+        def fake_materialize(provider, *, reset_plugin_state=False):
+            calls.append(reset_plugin_state)
+            yield "runtime"
+
+        with mock.patch.object(
+            cc_switch_config, "load_provider", return_value=self.provider
+        ), mock.patch.object(
+            cc_switch_config, "materialize_claude_profile", fake_materialize
+        ):
+            with cc_switch_config.use_claude_profile(
+                "anyrouter", self.root / "unused.db", reset_plugin_state=True
+            ) as runtime:
+                self.assertEqual(runtime, "runtime")
+
+        self.assertEqual(calls, [True])
 
 
 class ClaudeProfileRuntimeApiTests(unittest.TestCase):
