@@ -8,6 +8,7 @@ import re
 import signal
 import sqlite3
 import tempfile
+import tomllib
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from copy import deepcopy
 from contextlib import contextmanager
@@ -15,6 +16,14 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
+import tomli_w
+
+from provider_settings import (
+    claude_connection_env,
+    claude_provider_settings,
+    claude_shared_settings,
+    codex_settings,
+)
 from claude_overlay import (
     GLOBAL_CONFIG_NAME,
     ClaudeOverlayError,
@@ -28,6 +37,7 @@ from claude_plugin_state import (
     RuntimeSnapshot,
     effective_plugins,
     enabled_view,
+    installed_plugin_settings,
     read_installed_plugins,
     repair_install_paths,
 )
@@ -55,6 +65,7 @@ class SelectedProvider:
     name: str
     settings: dict[str, Any] = field(repr=False)
     meta: dict[str, Any] = field(default_factory=dict, repr=False)
+    shared_settings: dict[str, Any] | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -271,13 +282,6 @@ def _parse_provider_meta(
         raise CcSwitchConfigError(
             f"provider {provider_id!r} metadata must contain a JSON object"
         )
-    enabled = meta.get("commonConfigEnabled")
-    if enabled is not None and not isinstance(enabled, bool):
-        app_label = "Codex" if app_type == "codex" else "Claude"
-        raise CcSwitchConfigError(
-            f"{app_label} provider {provider_id!r} metadata "
-            "commonConfigEnabled must be boolean"
-        )
     return meta
 
 
@@ -302,39 +306,40 @@ def load_provider(
     return SelectedProvider(provider_id, app_type, name, settings, meta)
 
 
-def load_common_config(
-    app_type: AppType, db_path: str | Path = DEFAULT_DB_PATH
-) -> str:
-    """Read the selected app's Common Config without mutating CC Switch."""
-    if app_type not in ("codex", "claude"):
-        raise CcSwitchConfigError(
-            f"unsupported Common Config app type: {app_type!r}"
-        )
-
-    app_label = "Codex" if app_type == "codex" else "Claude"
-    resolved_path = _resolve_database_path(db_path)
-    connection: sqlite3.Connection | None = None
-    rows: list[tuple[object, ...]] = []
-    read_failed = False
+def read_codex_live_config(shared_home: Path) -> dict[str, Any]:
+    path = shared_home / "config.toml"
+    payload = ""
+    failed = False
     try:
-        connection = _open_read_only(resolved_path)
-        rows = list(
-            connection.execute(
-                "SELECT value FROM settings WHERE key = ?",
-                (f"common_config_{app_type}",),
-            )
-        )
-    except sqlite3.Error:
-        read_failed = True
-    finally:
-        if connection is not None:
-            connection.close()
+        payload = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        pass
+    except (OSError, UnicodeError):
+        failed = True
+    if not failed:
+        try:
+            return tomllib.loads(payload)
+        except (tomllib.TOMLDecodeError, RecursionError):
+            pass
+    raise CcSwitchConfigError("shared Codex configuration is invalid")
 
-    if read_failed:
-        raise CcSwitchConfigError(f"failed to read {app_label} Common Config")
-    if len(rows) != 1 or not isinstance(rows[0][0], str):
-        raise CcSwitchConfigError(f"{app_label} Common Config is missing or invalid")
-    return rows[0][0]
+
+def apply_codex_live_config(provider: SelectedProvider) -> SelectedProvider:
+    shared_home = Path(
+        os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))
+    ).expanduser()
+    shared = read_codex_live_config(shared_home)
+    settings = deepcopy(provider.settings)
+    failed = False
+    try:
+        settings["config"] = tomli_w.dumps(
+            codex_settings(tomllib.loads(settings["config"]), shared)
+        )
+    except (ValueError, TypeError, RecursionError):
+        failed = True
+    if failed:
+        raise CcSwitchConfigError("selected Codex configuration is invalid")
+    return replace(provider, settings=settings)
 
 
 def _json_deep_merge(
@@ -365,61 +370,40 @@ def _parse_claude_settings(payload: str, label: str) -> dict[str, Any]:
     return settings
 
 
-def apply_claude_common_config(
-    provider: SelectedProvider, db_path: str | Path = DEFAULT_DB_PATH
-) -> SelectedProvider:
-    """Overlay Claude Common Config when the provider enables it in CC Switch.
-
-    Like the CC Switch App, the provider is the base and Common Config is
-    deep-merged over it, so Common Config wins on conflicting values.
-    """
-    if provider.meta.get("commonConfigEnabled") is not True:
-        return provider
-    common = _parse_claude_settings(
-        load_common_config("claude", db_path), "Claude Common Config"
-    )
-    return replace(
-        provider, settings=_json_deep_merge(provider.settings, common)
-    )
-
-
 _CLAUDE_EFFORT_ENV_KEY = "CLAUDE_CODE_EFFORT_LEVEL"
 _CLAUDE_LAUNCH_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 
-def _load_claude_live_effort() -> str | None:
+def apply_claude_live_config(provider: SelectedProvider) -> SelectedProvider:
+    """Use current shared settings plus only this provider's connection fields."""
+    configured_home = os.environ.get("CLAUDE_CONFIG_DIR")
+    path = (
+        Path(configured_home).expanduser() / "settings.json"
+        if configured_home else CLAUDE_LIVE_SETTINGS_PATH
+    )
     payload = ""
-    read_failed = False
+    failed = False
     try:
-        payload = CLAUDE_LIVE_SETTINGS_PATH.read_text(encoding="utf-8")
+        payload = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         pass
-    except (OSError, UnicodeDecodeError):
-        read_failed = True
-
-    if read_failed:
+    except (OSError, UnicodeError):
+        failed = True
+    if failed:
         raise CcSwitchConfigError("failed to read Claude settings file")
-    settings = _parse_claude_settings(payload, "Claude settings file")
-    value = settings.get("env", {}).get(_CLAUDE_EFFORT_ENV_KEY)
-    return value if isinstance(value, str) and value.strip() else None
-
-
-def apply_claude_live_effort(provider: SelectedProvider) -> SelectedProvider:
-    """Prefer the effort level in Claude's live settings file.
-
-    CC Switch treats CLAUDE_CODE_EFFORT_LEVEL as a global setting: its editor
-    writes the value to the live file and leaves any copy in the provider row
-    as it was, so the row and Common Config are only fallbacks.
-    """
-    value = _load_claude_live_effort()
-    if value is None:
-        return provider
-    return replace(
-        provider,
-        settings=_json_deep_merge(
-            provider.settings, {"env": {_CLAUDE_EFFORT_ENV_KEY: value}}
-        ),
-    )
+    live = _parse_claude_settings(payload, "Claude settings file")
+    shared = claude_shared_settings(live)
+    selected = claude_provider_settings(provider.settings)
+    settings = _json_deep_merge(shared, selected)
+    # MCP definitions are indivisible: replacing a server must not inherit the
+    # other server's headers or credentials.
+    if "mcpServers" in selected:
+        base = shared.get("mcpServers", {})
+        servers = selected["mcpServers"]
+        if not isinstance(base, dict) or not isinstance(servers, dict):
+            raise CcSwitchConfigError("Claude mcpServers must be an object")
+        settings["mcpServers"] = {**deepcopy(base), **deepcopy(servers)}
+    return replace(provider, settings=settings, shared_settings=shared)
 
 
 def _take_claude_default_effort(settings: dict[str, Any]) -> str | None:
@@ -522,6 +506,11 @@ def _prepare_provider_runtime(
             raise ValueError("unsupported provider app type")
 
         environment = os.environ.copy()
+        if provider.app_type == "claude":
+            for key in tuple(environment):
+                if claude_connection_env(key):
+                    environment.pop(key, None)
+            environment.update(settings.get("env", {}))
         environment[environment_key] = str(root)
         runtime = ProviderRuntime(
             provider_id=provider.provider_id,
@@ -570,11 +559,6 @@ def materialize_provider(provider: SelectedProvider) -> Iterator[ProviderRuntime
 _CLAUDE_PROFILE_ERROR = (
     "Claude TUI launcher supports only CC Switch proxy profiles with "
     "ANTHROPIC_BASE_URL and exactly one API credential"
-)
-_CLAUDE_PARENT_AUTH_KEYS = (
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_API_KEY",
-    "CLAUDE_CODE_OAUTH_TOKEN",
 )
 
 
@@ -637,7 +621,7 @@ def _claude_shared_home(configured: str | None) -> tuple[Path, Path]:
     home = global_config = Path()
     try:
         if configured:
-            home = Path(configured)
+            home = Path(configured).expanduser().absolute()
             global_config = home / GLOBAL_CONFIG_NAME
             failed = not home.is_dir()
         else:
@@ -702,8 +686,9 @@ def _prepare_claude_profile(
         configured_home = os.environ.get("CLAUDE_CONFIG_DIR")
         shared_home, global_config = _claude_shared_home(configured_home)
         environment = os.environ.copy()
-        for key in _CLAUDE_PARENT_AUTH_KEYS:
-            environment.pop(key, None)
+        for key in tuple(environment):
+            if claude_connection_env(key):
+                environment.pop(key, None)
         environment.update(provider_environment)
         if _SECURE_STORAGE_ENV_KEY not in environment:
             # Keep keychain entry names: Claude Code adds no suffix for an
@@ -722,14 +707,21 @@ def _prepare_claude_profile(
                 repair_install_paths(shared_home, Path(tempfile.gettempdir()))
         except ClaudePluginStateError:
             pass  # Best effort: stale records only affect which plugins load.
+        installed = read_installed_plugins(shared_home / "plugins")
+        effective = installed_plugin_settings(effective, installed)
 
         temporary_directory = tempfile.TemporaryDirectory(prefix=OVERLAY_PREFIX)
         root = Path(temporary_directory.name)
         root.chmod(0o700)
         link_shared_entries(root, shared_home, global_config)
-        _write_private_file(
-            root / "settings.json", _json_document({"enabledPlugins": effective})
-        )
+        user_settings = deepcopy(provider.shared_settings or {})
+        user_settings.pop("mcpServers", None)
+        if default_effort is not None:
+            user_settings.get("env", {}).pop(_CLAUDE_EFFORT_ENV_KEY, None)
+        user_settings["enabledPlugins"] = effective
+        _write_private_file(root / "settings.json", _json_document(user_settings))
+        if provider.shared_settings is not None:
+            profile_settings = claude_provider_settings(profile_settings)
         settings_path = root / "provider-settings.json"
         _write_private_file(settings_path, _json_document(profile_settings))
         # Claude Code ignores mcpServers in --settings files, so provider MCP
@@ -758,7 +750,7 @@ def _prepare_claude_profile(
             baseline_plugins=baseline_plugins,
             initial_snapshot=RuntimeSnapshot(
                 enabled_view(effective),
-                read_installed_plugins(shared_home / "plugins"),
+                installed,
             ),
         )
     except BaseException as exc:
@@ -889,9 +881,9 @@ def use_provider(
 
     provider = load_provider(app_type, selector, db_path)
     if app_type == "claude":
-        provider = apply_claude_live_effort(
-            apply_claude_common_config(provider, db_path)
-        )
+        provider = apply_claude_live_config(provider)
+    else:
+        provider = apply_codex_live_config(provider)
     with _sigterm_as_system_exit():
         with materialize_provider(provider) as runtime:
             yield runtime
@@ -910,11 +902,7 @@ def use_claude_profile(
             "--cc-switch-config is currently supported only on macOS/Linux"
         )
 
-    provider = apply_claude_live_effort(
-        apply_claude_common_config(
-            load_provider("claude", selector, db_path), db_path
-        )
-    )
+    provider = apply_claude_live_config(load_provider("claude", selector, db_path))
     with _sigterm_as_system_exit():
         with materialize_claude_profile(
             provider, reset_plugin_state=reset_plugin_state

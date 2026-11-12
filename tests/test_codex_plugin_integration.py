@@ -217,6 +217,11 @@ requires_openai_auth = true
 source_type = "local"
 source = {json.dumps(str(self.marketplace))}
 '''
+        (self.shared_home / "config.toml").write_text(tomli_w.dumps({
+            "marketplaces": {"test-marketplace": {
+                "source_type": "local", "source": str(self.marketplace),
+            }},
+        }))
         settings = json.dumps(
             {
                 "config": provider_config,
@@ -460,7 +465,7 @@ source = {json.dumps(str(self.marketplace))}
         state = PluginStateStore(self.shared_home)
         defaults = self.root / "plugin-defaults.toml"
 
-        for baseline_source in ("provider", "project-defaults"):
+        for baseline_source in ("live", "project-defaults"):
             with self.subTest(baseline_source=baseline_source):
                 defaults.write_text(
                     f'[plugins."{PLUGIN_ID}"]\nenabled = true\n'
@@ -468,22 +473,13 @@ source = {json.dumps(str(self.marketplace))}
                     else "[plugins]\n",
                     encoding="utf-8",
                 )
-                with closing(sqlite3.connect(self.database)) as connection, connection:
-                    raw = connection.execute(
-                        "SELECT settings_config FROM providers WHERE id = ?",
-                        (PROVIDER_ID,),
-                    ).fetchone()[0]
-                    settings = json.loads(raw)
-                    document = tomllib.loads(settings["config"])
-                    if baseline_source == "provider":
-                        document["plugins"] = {PLUGIN_ID: {"enabled": True}}
-                    else:
-                        document.pop("plugins", None)
-                    settings["config"] = tomli_w.dumps(document)
-                    connection.execute(
-                        "UPDATE providers SET settings_config = ? WHERE id = ?",
-                        (json.dumps(settings), PROVIDER_ID),
-                    )
+                path = self.shared_home / "config.toml"
+                document = tomllib.loads(path.read_text())
+                if baseline_source == "live":
+                    document["plugins"] = {PLUGIN_ID: {"enabled": True}}
+                else:
+                    document.pop("plugins", None)
+                path.write_text(tomli_w.dumps(document))
 
                 state.reset_provider(PROVIDER_ID)
                 database_rows = self._database_rows()

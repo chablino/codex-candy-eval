@@ -8,8 +8,8 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from cc_switch_config import SelectedProvider, materialize_claude_profile
-from claude_plugin_state import ClaudePluginStateStore
+from cc_switch_config import SelectedProvider, materialize_claude_profile, use_claude_profile
+from claude_plugin_state import ClaudePluginStateStore, RuntimeSnapshot
 
 
 PLUGIN_ID = "demo@localmkt"
@@ -172,6 +172,81 @@ class ClaudePluginCliIntegrationTests(unittest.TestCase):
             self.assertTrue(path.startswith(str(self.shared_home) + os.sep))
             self.assertTrue(Path(path).is_dir())
         self.assertEqual(self.store.load_provider_plugins(PROVIDER_ID), {})
+
+    def test_launcher_reads_live_plugin_switch_and_keeps_project_precedence(self):
+        # Installation enabled the plugin in shared user settings. The provider
+        # row deliberately disagrees; it must not replace the live setting.
+        provider = replace(self.provider, settings={
+            **self.provider.settings, "enabledPlugins": {PLUGIN_ID: False},
+        }, meta={"commonConfigEnabled": True})
+        shared_path = self.shared_home / "settings.json"
+        shared_before = shared_path.read_bytes()
+        with mock.patch("cc_switch_config.load_provider", return_value=provider):
+            with use_claude_profile("integration") as runtime:
+                self.assertTrue(self._enabled(runtime))
+            project_settings = self.project / ".claude" / "settings.json"
+            project_settings.parent.mkdir()
+            project_settings.write_text(json.dumps({"enabledPlugins": {PLUGIN_ID: False}}))
+            with use_claude_profile("integration") as runtime:
+                self.assertFalse(self._enabled(runtime))
+        self.assertEqual(shared_path.read_bytes(), shared_before)
+
+    def test_uninstall_needs_no_manual_cleanup_in_other_provider(self):
+        shared_path = self.shared_home / "settings.json"
+        shared_before = shared_path.read_bytes()
+        # Install writes true into the shared file, which window-local uninstall
+        # will not edit. A different provider also remembers a deliberate disable.
+        self.store.apply_runtime_changes(
+            "disabled-provider", {PLUGIN_ID: True},
+            RuntimeSnapshot({PLUGIN_ID: True}, frozenset({PLUGIN_ID})),
+            RuntimeSnapshot({PLUGIN_ID: False}, frozenset({PLUGIN_ID})),
+        )
+        with mock.patch("cc_switch_config.load_provider", return_value=self.provider):
+            with use_claude_profile("integration") as runtime:
+                self._window_claude(runtime, "plugin", "uninstall", PLUGIN_ID)
+                self.assertIsNone(self._enabled(runtime))
+                # Another provider can start before the uninstalling window exits.
+                other = replace(self.provider, provider_id="other-provider")
+                with mock.patch("cc_switch_config.load_provider", return_value=other):
+                    with use_claude_profile("other") as next_runtime:
+                        self.assertNotIn(PLUGIN_ID, json.loads(
+                            (next_runtime.config_home / "settings.json").read_text()
+                        )["enabledPlugins"])
+                        self.assertIsNone(self._enabled(next_runtime))
+
+        for provider_id in ("other-provider", "disabled-provider"):
+            provider = replace(self.provider, provider_id=provider_id)
+            with mock.patch("cc_switch_config.load_provider", return_value=provider):
+                with use_claude_profile("next") as runtime:
+                    self.assertNotIn(PLUGIN_ID, json.loads(
+                        (runtime.config_home / "settings.json").read_text()
+                    )["enabledPlugins"])
+                    self.assertIsNone(self._enabled(runtime))
+        self.assertEqual(shared_path.read_bytes(), shared_before)
+        self.assertEqual(self.store.load_provider_plugins("disabled-provider"),
+                         {PLUGIN_ID: False})
+
+        # Explicit reinstall makes the remembered disable relevant again.
+        self._claude(dict(os.environ), "plugin", "install", PLUGIN_ID, "--scope", "user")
+        provider = replace(self.provider, provider_id="disabled-provider")
+        with mock.patch("cc_switch_config.load_provider", return_value=provider):
+            with use_claude_profile("next") as runtime:
+                self.assertFalse(self._enabled(runtime))
+
+    def test_uninstalled_false_global_entry_is_omitted_in_new_window(self):
+        self._claude(dict(os.environ), "plugin", "uninstall", PLUGIN_ID)
+        shared_path = self.shared_home / "settings.json"
+        settings = json.loads(shared_path.read_text())
+        settings["enabledPlugins"] = {PLUGIN_ID: False}
+        shared_path.write_text(json.dumps(settings))
+        shared_before = shared_path.read_bytes()
+        with mock.patch("cc_switch_config.load_provider", return_value=self.provider):
+            with use_claude_profile("integration") as runtime:
+                self.assertNotIn(PLUGIN_ID, json.loads(
+                    (runtime.config_home / "settings.json").read_text()
+                )["enabledPlugins"])
+                self.assertIsNone(self._enabled(runtime))
+        self.assertEqual(shared_path.read_bytes(), shared_before)
 
 
 if __name__ == "__main__":

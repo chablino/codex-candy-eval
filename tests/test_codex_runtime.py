@@ -278,7 +278,7 @@ enabled = true
         parent_environment = self.environment(OPENAI_API_KEY="parent-secret")
 
         with mock.patch.dict(os.environ, parent_environment, clear=True):
-            with materialize_codex_runtime(self.provider, None) as runtime:
+            with materialize_codex_runtime(self.provider) as runtime:
                 runtime_home = runtime.home
                 config_text = runtime.config_path.read_text(encoding="utf-8")
                 config = tomllib.loads(config_text)
@@ -288,7 +288,7 @@ enabled = true
                 self.assertEqual(runtime.config_path, runtime_home / "config.toml")
                 self.assertNotEqual(runtime_home, self.shared_home)
                 self.assertEqual(config["model"], "gpt-provider")
-                self.assertNotIn("shared-only@test", config.get("plugins", {}))
+                self.assertTrue(config["plugins"]["shared-only@test"]["enabled"])
                 self.assertFalse(config["plugins"][plugin_id]["enabled"])
                 self.assertEqual(
                     config["marketplaces"]["shared"]["source"],
@@ -391,7 +391,7 @@ enabled = true
             )
 
         with mock.patch.dict(os.environ, self.environment(), clear=True):
-            with materialize_codex_runtime(self.provider, None):
+            with materialize_codex_runtime(self.provider):
                 with closing(sqlite3.connect(database)) as connection:
                     repaired = connection.execute(
                         "SELECT rollout_path FROM threads WHERE id = ?",
@@ -445,7 +445,7 @@ enabled = true
             )
 
         with mock.patch.dict(os.environ, self.environment(), clear=True):
-            with materialize_codex_runtime(self.provider, None) as runtime:
+            with materialize_codex_runtime(self.provider) as runtime:
                 runtime_rollout = runtime.home / "sessions" / relative
                 self.assertFalse((runtime.home / "sessions").is_symlink())
                 self.assertTrue(os.path.samefile(runtime_rollout, rollout))
@@ -491,7 +491,7 @@ enabled = true
             )
 
         with mock.patch.dict(os.environ, self.environment(), clear=True):
-            with materialize_codex_runtime(self.provider, None) as runtime:
+            with materialize_codex_runtime(self.provider) as runtime:
                 self.assertEqual(runtime.activate_provider_rollouts(), 1)
                 with closing(sqlite3.connect(database)) as connection:
                     paths = dict(
@@ -536,12 +536,12 @@ enabled = true
                 ).fetchone()[0]
 
         with mock.patch.dict(os.environ, self.environment(), clear=True):
-            with materialize_codex_runtime(self.provider, None) as first:
+            with materialize_codex_runtime(self.provider) as first:
                 first.activate_thread_rollout(thread_id)
                 active_path = str((first.home / "sessions" / relative).resolve())
                 self.assertEqual(indexed_path(), active_path)
 
-                with materialize_codex_runtime(self.provider, None):
+                with materialize_codex_runtime(self.provider):
                     after_startup = indexed_path()
                     # Simulate the first TUI persisting its active path again.
                     with closing(sqlite3.connect(database)) as connection, connection:
@@ -569,7 +569,7 @@ enabled = true
         database = self.create_state_database()
 
         with mock.patch.dict(os.environ, self.environment(), clear=True):
-            with materialize_codex_runtime(self.provider, None) as runtime:
+            with materialize_codex_runtime(self.provider) as runtime:
                 runtime_home = runtime.home
                 rollout = runtime.home / "sessions" / relative
                 rollout.parent.mkdir(parents=True, exist_ok=True)
@@ -673,7 +673,7 @@ enabled = true
                         )
 
                     with mock.patch.dict(os.environ, self.environment(), clear=True):
-                        with materialize_codex_runtime(self.provider, None) as runtime:
+                        with materialize_codex_runtime(self.provider) as runtime:
                             with closing(sqlite3.connect(database)) as connection:
                                 repaired = connection.execute(
                                     "SELECT rollout_path FROM threads WHERE id = ?",
@@ -711,7 +711,7 @@ enabled = true
         content = json.dumps({"type": "session_meta", "payload": {"id": thread_id}}) + "\n"
         with mock.patch.dict(os.environ, self.environment(), clear=True):
             with self.assertRaises(KeyboardInterrupt):
-                with materialize_codex_runtime(self.provider, None) as runtime:
+                with materialize_codex_runtime(self.provider) as runtime:
                     runtime_home = runtime.home
                     rollout = runtime.home / "sessions" / relative
                     rollout.parent.mkdir(parents=True, exist_ok=True)
@@ -748,7 +748,7 @@ enabled = true
                     thread_id, str(stale), self.shared_home
                 ))
                 with mock.patch.dict(os.environ, self.environment(), clear=True):
-                    with materialize_codex_runtime(self.provider, None) as runtime:
+                    with materialize_codex_runtime(self.provider) as runtime:
                         self.assertIsNone(codex_runtime._runtime_rollout_path(
                             thread_id, str(rollout), runtime.home, self.shared_home
                         ))
@@ -770,7 +770,7 @@ enabled = true
             os.environ, self.environment(HYPERFRAMES_SKIP_SKILLS="0"), clear=True
         ):
             for provider in (self.provider, other):
-                with materialize_codex_runtime(provider, None) as runtime:
+                with materialize_codex_runtime(provider) as runtime:
                     document = tomllib.loads(runtime.config_path.read_text())
                     self.assertEqual(document["skills"]["config"], [
                         {"path": skill_path, "enabled": False}
@@ -785,27 +785,28 @@ enabled = true
         self.assertEqual(policy_path.read_text(), policy)
         self.assertEqual(shared_config.read_text(), 'model = "shared-default"\n')
 
-    def test_common_config_merges_structurally_when_supplied(self):
+    def test_live_config_supplies_plugins_without_replacing_selected_model(self):
         plugin_id = self.install_plugin()
-        common = f'''\
+        shared = f'''\
 model = "gpt-common"
 
 [plugins."{plugin_id}"]
 enabled = true
 '''
 
+        (self.shared_home / "config.toml").write_text(shared)
         with mock.patch.dict(os.environ, self.environment(), clear=True):
-            with materialize_codex_runtime(self.provider, common) as runtime:
+            with materialize_codex_runtime(self.provider) as runtime:
                 config = tomllib.loads(runtime.config_path.read_text())
 
-        self.assertEqual(config["model"], "gpt-common")
+        self.assertEqual(config["model"], "gpt-provider")
         self.assertTrue(config["plugins"][plugin_id]["enabled"])
 
     def test_installed_plugins_follow_project_defaults(self):
         self.install_default_plugins()
 
         with mock.patch.dict(os.environ, self.environment(), clear=True):
-            with materialize_codex_runtime(self.provider, None) as runtime:
+            with materialize_codex_runtime(self.provider) as runtime:
                 config = tomllib.loads(runtime.config_path.read_text())
 
                 self.assertEqual(
@@ -833,18 +834,18 @@ enabled = true
         )
         with mock.patch.object(codex_runtime, "_DEFAULT_PLUGIN_CONFIG_PATH", defaults):
             with mock.patch.dict(os.environ, self.environment(), clear=True):
-                with materialize_codex_runtime(self.provider, None) as runtime:
+                with materialize_codex_runtime(self.provider) as runtime:
                     config = tomllib.loads(runtime.config_path.read_text())
                     self.assertTrue(config["plugins"][plugin_id]["enabled"])
 
                 shutil.rmtree(plugin_root)
-                with materialize_codex_runtime(self.provider, None) as runtime:
+                with materialize_codex_runtime(self.provider) as runtime:
                     config = tomllib.loads(runtime.config_path.read_text())
                     self.assertNotIn(plugin_id, config.get("plugins", {}))
                     self.assertEqual(runtime.warnings, ())
 
                 self.install_plugin(plugin, marketplace)
-                with materialize_codex_runtime(self.provider, None) as runtime:
+                with materialize_codex_runtime(self.provider) as runtime:
                     config = tomllib.loads(runtime.config_path.read_text())
                     self.assertTrue(config["plugins"][plugin_id]["enabled"])
 
@@ -865,10 +866,10 @@ enabled = true
                 "auth": {"OPENAI_API_KEY": "provider-secret"},
             },
         )
-        common = f'''\
+        shared = f'''\
 [plugins."{plugin_id}"]
 enabled = true
-common_option = "kept"
+shared_option = "kept"
 '''
         initial = RuntimeSnapshot(
             plugins={plugin_id: True},
@@ -887,14 +888,15 @@ common_option = "kept"
             final,
         )
 
+        (self.shared_home / "config.toml").write_text(shared)
         with mock.patch.dict(os.environ, self.environment(), clear=True):
-            with materialize_codex_runtime(provider, common) as runtime:
+            with materialize_codex_runtime(provider) as runtime:
                 config = tomllib.loads(runtime.config_path.read_text())
 
         entry = config["plugins"][plugin_id]
         self.assertFalse(entry["enabled"])
-        self.assertEqual(entry["provider_option"], "kept")
-        self.assertEqual(entry["common_option"], "kept")
+        self.assertNotIn("provider_option", entry)
+        self.assertEqual(entry["shared_option"], "kept")
 
     def test_auth_transformation_targets_only_selected_model_provider(self):
         config = """\
@@ -920,13 +922,11 @@ requires_openai_auth = true
         )
 
         with mock.patch.dict(os.environ, self.environment(), clear=True):
-            with materialize_codex_runtime(provider, None) as runtime:
+            with materialize_codex_runtime(provider) as runtime:
                 parsed = tomllib.loads(runtime.config_path.read_text())
 
-        self.assertTrue(parsed["unrelated"]["requires_openai_auth"])
-        self.assertTrue(
-            parsed["model_providers"]["other"]["requires_openai_auth"]
-        )
+        self.assertNotIn("unrelated", parsed)
+        self.assertNotIn("other", parsed["model_providers"])
         selected = parsed["model_providers"]["selected provider"]
         self.assertFalse(selected["requires_openai_auth"])
         self.assertEqual(selected["env_key"], "OPENAI_API_KEY")
@@ -946,8 +946,9 @@ requires_openai_auth = true
             },
         )
 
+        (self.shared_home / "config.toml").write_text(tomli_w.dumps(document))
         with mock.patch.dict(os.environ, self.environment(), clear=True):
-            with materialize_codex_runtime(provider, None) as runtime:
+            with materialize_codex_runtime(provider) as runtime:
                 parsed = tomllib.loads(runtime.config_path.read_text())
                 self.assertTrue(
                     parsed["plugins"][CANONICAL_SUPERPOWERS_ID]["enabled"]
@@ -972,7 +973,7 @@ requires_openai_auth = true
 
         with mock.patch.dict(os.environ, self.environment(), clear=True):
             with materialize_codex_runtime(
-                self.provider, None, reset_plugin_state=True
+                self.provider, reset_plugin_state=True
             ):
                 self.assertFalse(sidecar.exists())
 
@@ -983,14 +984,14 @@ requires_openai_auth = true
 
         with mock.patch.dict(os.environ, self.environment(), clear=True):
             with self.assertRaises(CcSwitchConfigError) as raised:
-                with materialize_codex_runtime(self.provider, None):
+                with materialize_codex_runtime(self.provider):
                     pass
 
         self.assertNotIn("not-json", str(raised.exception))
         self.assertIsNone(raised.exception.__cause__)
         self.assertIsNone(raised.exception.__context__)
 
-    def test_invalid_provider_common_and_shared_toml_are_sanitized(self):
+    def test_invalid_provider_and_shared_toml_are_sanitized(self):
         cases = []
         bad_provider = SelectedProvider(
             "id",
@@ -1001,11 +1002,10 @@ requires_openai_auth = true
                 "auth": {"OPENAI_API_KEY": "secret"},
             },
         )
-        cases.append((bad_provider, None, None, "secret-provider"))
-        cases.append((self.provider, "secret-common = [", None, "secret-common"))
-        cases.append((self.provider, None, "secret-shared = [", "secret-shared"))
+        cases.append((bad_provider, None, "secret-provider"))
+        cases.append((self.provider, "secret-shared = [", "secret-shared"))
 
-        for provider, common, shared, secret in cases:
+        for provider, shared, secret in cases:
             with self.subTest(secret=secret):
                 shared_path = self.shared_home / "config.toml"
                 if shared is None:
@@ -1018,7 +1018,7 @@ requires_openai_auth = true
                     codex_runtime.tempfile, "TemporaryDirectory"
                 ) as temporary_directory:
                     with self.assertRaises(CcSwitchConfigError) as raised:
-                        with materialize_codex_runtime(provider, common):
+                        with materialize_codex_runtime(provider):
                             pass
 
                 self.assertNotIn(secret, str(raised.exception))
@@ -1072,7 +1072,7 @@ requires_openai_auth = true
                 codex_runtime.tempfile, "TemporaryDirectory"
             ) as temporary_directory:
                 with self.assertRaises(CcSwitchConfigError) as raised:
-                    with materialize_codex_runtime(provider, None):
+                    with materialize_codex_runtime(provider):
                         pass
 
             self.assertIn("single OPENAI_API_KEY", str(raised.exception))
@@ -1117,7 +1117,7 @@ requires_openai_auth = true
                 os.environ, environment, clear=True
             ):
                 with self.assertRaisesRegex(CcSwitchConfigError, label):
-                    with materialize_codex_runtime(self.provider, None):
+                    with materialize_codex_runtime(self.provider):
                         pass
 
         self.assertFalse(missing.exists())
@@ -1129,7 +1129,7 @@ requires_openai_auth = true
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
             codex_runtime.Path, "home", return_value=self.root
         ):
-            with materialize_codex_runtime(self.provider, None) as runtime:
+            with materialize_codex_runtime(self.provider) as runtime:
                 self.assertEqual(
                     runtime.environment["CODEX_SQLITE_HOME"],
                     str(default_home.resolve()),
@@ -1148,7 +1148,7 @@ requires_openai_auth = true
         )
 
         with mock.patch.dict(os.environ, self.environment(), clear=True):
-            with materialize_codex_runtime(provider, None) as runtime:
+            with materialize_codex_runtime(provider) as runtime:
                 config = tomllib.loads(runtime.config_path.read_text())
 
                 self.assertNotIn("sqlite_home", config)
@@ -1174,7 +1174,7 @@ requires_openai_auth = true
                     os.environ, self.environment(), clear=True
                 ):
                     with self.assertRaises(CcSwitchConfigError):
-                        with materialize_codex_runtime(self.provider, None):
+                        with materialize_codex_runtime(self.provider):
                             pass
                 if path.is_dir():
                     path.rmdir()
@@ -1184,7 +1184,7 @@ requires_openai_auth = true
         unknown = self.shared_home / "unknown-state"
         unknown.write_text("shared\n", encoding="utf-8")
         with mock.patch.dict(os.environ, self.environment(), clear=True):
-            with materialize_codex_runtime(self.provider, None) as runtime:
+            with materialize_codex_runtime(self.provider) as runtime:
                 self.assertFalse((runtime.home / unknown.name).exists())
 
     def test_explicit_originator_is_preserved(self):
@@ -1193,7 +1193,7 @@ requires_openai_auth = true
         )
 
         with mock.patch.dict(os.environ, environment, clear=True):
-            with materialize_codex_runtime(self.provider, None) as runtime:
+            with materialize_codex_runtime(self.provider) as runtime:
                 self.assertEqual(
                     runtime.environment["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"],
                     "custom-client",
@@ -1201,9 +1201,9 @@ requires_openai_auth = true
 
     def test_concurrent_runtime_homes_are_unique_and_clean_independently(self):
         with mock.patch.dict(os.environ, self.environment(), clear=True):
-            with materialize_codex_runtime(self.provider, None) as first:
+            with materialize_codex_runtime(self.provider) as first:
                 first_home = first.home
-                with materialize_codex_runtime(self.provider, None) as second:
+                with materialize_codex_runtime(self.provider) as second:
                     second_home = second.home
                     self.assertNotEqual(first_home, second_home)
                     self.assertTrue(first_home.is_dir())
@@ -1217,7 +1217,7 @@ requires_openai_auth = true
 
         with mock.patch.dict(os.environ, self.environment(), clear=True):
             with self.assertRaisesRegex(RuntimeError, "body failure"):
-                with materialize_codex_runtime(self.provider, None) as runtime:
+                with materialize_codex_runtime(self.provider) as runtime:
                     runtime_home = runtime.home
                     raise RuntimeError("body failure")
 
@@ -1239,7 +1239,7 @@ requires_openai_auth = true
             codex_runtime, "_write_private_file", side_effect=fail_after_write
         ):
             with self.assertRaises(CcSwitchConfigError) as raised:
-                with materialize_codex_runtime(self.provider, None):
+                with materialize_codex_runtime(self.provider):
                     pass
 
         self.assertIsNotNone(created_home)
@@ -1264,7 +1264,7 @@ requires_openai_auth = true
             side_effect=fail_after_cleanup,
         ):
             with self.assertRaises(CcSwitchConfigError) as raised:
-                with materialize_codex_runtime(self.provider, None):
+                with materialize_codex_runtime(self.provider):
                     pass
 
         self.assertNotIn("cleanup-secret", str(raised.exception))
@@ -1288,7 +1288,7 @@ requires_openai_auth = true
             side_effect=fail_after_cleanup,
         ):
             with self.assertRaises(KeyboardInterrupt) as raised:
-                with materialize_codex_runtime(self.provider, None):
+                with materialize_codex_runtime(self.provider):
                     raise body_error
 
         self.assertIs(raised.exception, body_error)
@@ -1365,7 +1365,7 @@ class CodexRuntimeFinalizationTests(unittest.TestCase):
         plugin_id, _ = self.install_plugin()
 
         with mock.patch.dict(os.environ, self.environment(), clear=True):
-            with materialize_codex_runtime(self.provider, None) as runtime:
+            with materialize_codex_runtime(self.provider) as runtime:
                 self.assertFalse(self.plugin_enabled(runtime, plugin_id))
                 self.set_plugin(runtime, plugin_id, True)
 
@@ -1378,9 +1378,9 @@ class CodexRuntimeFinalizationTests(unittest.TestCase):
         plugin_id, _ = self.install_plugin()
 
         with mock.patch.dict(os.environ, self.environment(), clear=True):
-            with materialize_codex_runtime(self.provider, None) as runtime:
+            with materialize_codex_runtime(self.provider) as runtime:
                 self.set_plugin(runtime, plugin_id, True)
-            with materialize_codex_runtime(self.provider, None) as runtime:
+            with materialize_codex_runtime(self.provider) as runtime:
                 self.assertTrue(self.plugin_enabled(runtime, plugin_id))
                 self.set_plugin(runtime, plugin_id, False)
 
@@ -1398,7 +1398,7 @@ class CodexRuntimeFinalizationTests(unittest.TestCase):
 
         with mock.patch.object(codex_runtime, "_DEFAULT_PLUGIN_CONFIG_PATH", defaults):
             with mock.patch.dict(os.environ, self.environment(), clear=True):
-                with materialize_codex_runtime(self.provider, None) as runtime:
+                with materialize_codex_runtime(self.provider) as runtime:
                     self.assertTrue(self.plugin_enabled(runtime, plugin_id))
                     self.set_plugin(runtime, plugin_id, False)
 
@@ -1407,7 +1407,7 @@ class CodexRuntimeFinalizationTests(unittest.TestCase):
                     {plugin_id: False},
                 )
 
-                with materialize_codex_runtime(self.provider, None) as runtime:
+                with materialize_codex_runtime(self.provider) as runtime:
                     self.assertFalse(self.plugin_enabled(runtime, plugin_id))
                     self.set_plugin(runtime, plugin_id, True)
 
@@ -1417,7 +1417,7 @@ class CodexRuntimeFinalizationTests(unittest.TestCase):
         plugin_id = "demo@test"
 
         with mock.patch.dict(os.environ, self.environment(), clear=True):
-            with materialize_codex_runtime(self.provider, None) as runtime:
+            with materialize_codex_runtime(self.provider) as runtime:
                 installed_id, plugin_root = self.install_plugin()
                 self.assertEqual(installed_id, plugin_id)
                 self.set_plugin(runtime, plugin_id, True)
@@ -1433,7 +1433,7 @@ class CodexRuntimeFinalizationTests(unittest.TestCase):
         self.seed_sidecar("other-provider", plugin_id)
 
         with mock.patch.dict(os.environ, self.environment(), clear=True):
-            with materialize_codex_runtime(self.provider, None) as runtime:
+            with materialize_codex_runtime(self.provider) as runtime:
                 self.assertTrue(self.plugin_enabled(runtime, plugin_id))
                 shutil.rmtree(plugin_root)
 
@@ -1444,7 +1444,7 @@ class CodexRuntimeFinalizationTests(unittest.TestCase):
         plugin_id, _ = self.install_plugin()
 
         with mock.patch.dict(os.environ, self.environment(), clear=True):
-            with materialize_codex_runtime(self.provider, None) as old_runtime:
+            with materialize_codex_runtime(self.provider) as old_runtime:
                 self.assertFalse(self.plugin_enabled(old_runtime, plugin_id))
                 self.seed_sidecar("provider-id", plugin_id)
 
@@ -1457,7 +1457,7 @@ class CodexRuntimeFinalizationTests(unittest.TestCase):
 
         with mock.patch.dict(os.environ, self.environment(), clear=True):
             with self.assertRaises(CcSwitchConfigError) as raised:
-                with materialize_codex_runtime(self.provider, None) as runtime:
+                with materialize_codex_runtime(self.provider) as runtime:
                     runtime_home = runtime.home
                     runtime.config_path.write_text(
                         "final-config-secret = [", encoding="utf-8"
@@ -1481,7 +1481,7 @@ class CodexRuntimeFinalizationTests(unittest.TestCase):
             side_effect=OSError("sync-secret"),
         ):
             with self.assertRaises(CcSwitchConfigError) as raised:
-                with materialize_codex_runtime(self.provider, None) as runtime:
+                with materialize_codex_runtime(self.provider) as runtime:
                     runtime_home = runtime.home
 
         self.assertIsNotNone(runtime_home)
@@ -1511,7 +1511,7 @@ class CodexRuntimeFinalizationTests(unittest.TestCase):
             side_effect=fail_after_cleanup,
         ):
             with self.assertRaises(KeyboardInterrupt) as raised:
-                with materialize_codex_runtime(self.provider, None) as runtime:
+                with materialize_codex_runtime(self.provider) as runtime:
                     runtime_home = runtime.home
                     raise body_error
 
@@ -1555,15 +1555,13 @@ class UseCodexRuntimeTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def test_false_or_missing_common_flag_never_queries_common_config(self):
-        for meta in ({}, {"commonConfigEnabled": False}):
+    def test_legacy_flag_never_queries_common_config(self):
+        for meta in ({}, {"commonConfigEnabled": False}, {"commonConfigEnabled": True}):
             with self.subTest(meta=meta), mock.patch.dict(
                 os.environ, {"CODEX_HOME": str(self.shared_home)}, clear=True
             ), mock.patch.object(
                 codex_runtime, "load_provider", return_value=self.provider(meta)
-            ) as load, mock.patch.object(
-                codex_runtime, "load_common_config"
-            ) as load_common:
+            ) as load:
                 with codex_runtime.use_codex_runtime(
                     "fengwind", db_path=self.root / "cc-switch.db"
                 ) as runtime:
@@ -1573,29 +1571,7 @@ class UseCodexRuntimeTests(unittest.TestCase):
             load.assert_called_once_with(
                 "codex", "fengwind", self.root / "cc-switch.db"
             )
-            load_common.assert_not_called()
 
-    def test_true_common_flag_loads_and_merges_common_config(self):
-        provider = self.provider({"commonConfigEnabled": True})
-
-        with mock.patch.dict(
-            os.environ, {"CODEX_HOME": str(self.shared_home)}, clear=True
-        ), mock.patch.object(
-            codex_runtime, "load_provider", return_value=provider
-        ), mock.patch.object(
-            codex_runtime,
-            "load_common_config",
-            return_value='model = "gpt-common"\n',
-        ) as load_common:
-            with codex_runtime.use_codex_runtime(
-                "fengwind", db_path=self.root / "cc-switch.db"
-            ) as runtime:
-                config = tomllib.loads(runtime.config_path.read_text())
-
-        self.assertEqual(config["model"], "gpt-common")
-        load_common.assert_called_once_with(
-            "codex", self.root / "cc-switch.db"
-        )
 
     def test_reset_flag_is_applied_before_malformed_sidecar_load(self):
         sidecar_digest = hashlib.sha256(b"provider-id").hexdigest()
@@ -1612,7 +1588,7 @@ class UseCodexRuntimeTests(unittest.TestCase):
             os.environ, {"CODEX_HOME": str(self.shared_home)}, clear=True
         ), mock.patch.object(
             codex_runtime, "load_provider", return_value=self.provider()
-        ), mock.patch.object(codex_runtime, "load_common_config") as load_common:
+        ):
             with codex_runtime.use_codex_runtime(
                 "fengwind",
                 reset_plugin_state=True,
@@ -1620,7 +1596,6 @@ class UseCodexRuntimeTests(unittest.TestCase):
             ):
                 self.assertFalse(sidecar.exists())
 
-        load_common.assert_not_called()
 
     def test_sigterm_synchronizes_plugin_change_and_cleans_runtime(self):
         self.install_plugin()

@@ -180,7 +180,7 @@ def edit_provider_mcp(
 ) -> Iterator[ProviderMcpEditor]:
     """Give native Codex a private provider config for an explicit MCP edit.
 
-    The caller saves only after the native command succeeds. Common Config,
+    The caller saves only after the native command succeeds. Shared live configuration,
     global config, plugin sidecars, auth and session state are not copied here.
     """
     if os.name == "nt":

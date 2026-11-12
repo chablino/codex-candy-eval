@@ -13,6 +13,7 @@ from claude_plugin_state import (
     RuntimeSnapshot,
     effective_plugins,
     enabled_view,
+    installed_plugin_settings,
     read_installed_plugins,
     repair_install_paths,
 )
@@ -40,6 +41,21 @@ class ImportTests(unittest.TestCase):
 
 
 class PluginViewTests(unittest.TestCase):
+    def test_uninstalled_plugin_settings_are_omitted_without_erasing_preferences(self):
+        for value in (True, False, ["^1.0"]):
+            with self.subTest(value=value):
+                preferences = {PLUGIN: value, OTHER: False}
+                self.assertEqual(
+                    installed_plugin_settings(preferences, frozenset({OTHER})),
+                    {OTHER: False},
+                )
+                self.assertEqual(preferences[PLUGIN], value)
+                self.assertEqual(installed_plugin_settings(preferences, BOTH), preferences)
+
+    def test_unknown_installs_do_not_restore_stale_enables(self):
+        with self.assertRaisesRegex(ClaudePluginStateError, "installation record"):
+            installed_plugin_settings({PLUGIN: True}, None)
+
     def test_enabled_view_matches_claude_code(self):
         self.assertEqual(
             enabled_view(
@@ -78,11 +94,20 @@ class InstalledPluginsTests(unittest.TestCase):
         self.assertEqual(read_installed_plugins(self.plugins_root), BOTH)
 
     def test_unreadable_record_is_unknown(self):
-        for payload in ("{", "[]", '{"plugins": []}'):
+        for payload in (
+            "{", "[]", '{"plugins": []}', '{"plugins":{"p@m":true}}',
+            '{"plugins":{"p@m":["bad record"]}}',
+        ):
             with self.subTest(payload=payload):
                 self.record.write_text(payload, "utf-8")
 
                 self.assertIsNone(read_installed_plugins(self.plugins_root))
+
+    def test_empty_install_array_is_not_an_installed_plugin(self):
+        self.record.write_text(json.dumps({"version": 2, "plugins": {
+            PLUGIN: [], OTHER: [{"scope": "user"}],
+        }}))
+        self.assertEqual(read_installed_plugins(self.plugins_root), frozenset({OTHER}))
 
 
 class StoreTests(unittest.TestCase):
@@ -174,6 +199,11 @@ class StoreTests(unittest.TestCase):
                 self.assertEqual(
                     self.store.load_provider_plugins("provider-b"), {PLUGIN: True}
                 )
+
+    def test_stale_window_cannot_save_enable_for_uninstalled_plugin(self):
+        self.sync("provider-a", {}, {PLUGIN: False}, {PLUGIN: True},
+                  installed=(BOTH, frozenset({OTHER})))
+        self.assertEqual(self.store.load_provider_plugins("provider-a"), {})
 
     def test_concurrent_windows_keep_both_changes(self):
         baseline = {PLUGIN: True, OTHER: True}

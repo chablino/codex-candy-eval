@@ -51,12 +51,15 @@ python3 /path/to/codex-candy-eval/codex_tui.py \
 
 启动器只查找 `app_type=codex` 的 provider，并从 CC Switch SQLite 数据库只读加载指定
 provider；普通启动不会读取或改变 App 当前选中的 provider，也不会修改数据库。下面介绍的
-显式 `mcp add/remove` 命令会备份并保存所选 provider 的 MCP 声明。启动时的最终配置按以下顺序
-生成：先应用项目 `codex_plugin_defaults.toml` 中当前确实已安装的默认插件开关；再叠加
-provider 原始配置；仅当该 provider 在 CC Switch 中开启 `Apply Common Config` 时，再结构化
-合并 Codex Common Config；最后叠加该 provider 自己的 `/plugins` 开关。因此，未开启
-`Apply Common Config` 就完全不会并入 Common Config，provider、Common Config 和 sidecar
-也都可以覆盖项目默认开关。
+显式 `mcp add/remove` 命令会备份并保存所选 provider 的 MCP 声明。启动时读取共享
+`CODEX_HOME/config.toml`（默认 `~/.codex/config.toml`）的用户设置，再使用所选 provider
+的地址、凭证、模型、推理档位和兼容参数。全局文件中当前另一家 provider 的路由、凭证、
+模型及默认 profile 不会带入。插件、权限、功能开关、TUI 和全局 MCP 等来自当前共享文件；
+数据库中旧 `common_config_codex` 和 `commonConfigEnabled` 已不再读取，供应商行中遗留的
+插件、权限等旧全局字段也不再参与启动。
+
+项目 `codex_plugin_defaults.toml` 只提供已安装插件的兜底开关；共享 `config.toml` 的显式
+插件设置覆盖它，最后叠加该 provider 保存的 `/plugins` 开关。每次启动重新读取共享文件。
 
 每次启动都会创建独立的临时 `CODEX_HOME`，其中包含这次运行的完整 `config.toml`，不使用
 Codex profile。provider 的 token 通过该子进程的 `OPENAI_API_KEY` 注入，并写入本次临时
@@ -79,7 +82,7 @@ Codex 0.147.0 起，SQLite thread 索引会保存 rollout JSONL 的绝对路径�
 `CODEX_HOME/sessions/...`。启动时只修复临时 home 已经消失、且共享 JSONL 仍存在的失效
 记录；其他窗口的临时 home 仍存在时会保留其路径，避免一个窗口启动或退出后，另一个
 窗口的分叉操作报 `rollout path must be in Codex home directory`。新会话也不会在临时目录
-删除后变成只能看到但无法 fork 的记录。provider 或 Common Config 中的 `sqlite_home`
+删除后变成只能看到但无法 fork 的记录。共享配置中的 `sqlite_home`
 不会覆盖启动器选定的共享 SQLite 目录。
 
 Codex 0.156.1 的 rollout 文件还可能使用 `...-SESSION_ID_SEGMENT_UUID.jsonl` 格式。
@@ -112,8 +115,8 @@ Codex 0.147.0 可能提示 `no rollout found`。先提交至少一轮消息再 `
   开启覆盖；明确保存的关闭覆盖仍保留。如果该插件在当前 provider 的配置或项目默认值中
   默认开启，卸载会为当前 provider 保存 `false`，避免下次启动或其他 provider 重新安装后
   又自动启用。
-- provider 配置或已启用的 Common Config 可以声明插件的默认开关；当前 provider 后续在
-  `/plugins` 中做出的开关变化优先于这个默认值。
+- 共享 `config.toml` 声明插件默认开关；当前 provider 后续在 `/plugins` 中做出的开关
+  变化优先于这个默认值。
 
 `codex_plugin_defaults.toml` 当前与普通 `codex` 的全局配置保持一致，默认启用 Documents、
 PDF、Presentations、Spreadsheets 和 Template Creator。Superpowers、HyperFrames、Browser、
@@ -122,23 +125,19 @@ Visualize 等插件不在默认表中，仍然需要按 provider 在 `/plugins` 
 插件或编辑另一个中转站不会改变 provider 的 sidecar；修改默认表后，应重新验证各 provider
 的关闭覆盖。
 
-插件开关的完整覆盖顺序从低到高为：已安装的项目默认值、provider 原始配置、开启
-`Apply Common Config` 时的 Common Config、当前 provider 的 `/plugins` sidecar。默认值、
-provider 与可选 Common Config 共同构成 baseline，因此关闭默认插件只会为当前 provider
-保存一个稀疏的 `false`；恢复到 baseline 后，这条 provider 覆盖会自动删除。
+插件开关的完整覆盖顺序从低到高为：已安装的项目默认值、共享 `config.toml`、当前 provider
+的 `/plugins` sidecar。前两层构成 baseline，因此关闭默认插件只会为当前 provider 保存
+一个稀疏的 `false`；恢复到 baseline 后，这条覆盖会自动删除。
 
-从 CC Switch 配置编辑器删除插件条目表示不再声明该层的值，不等于禁用：如果项目默认列表
-仍启用它，下次启动会继承这个默认值。当前项目默认表只包含五个文档插件，Superpowers 和
-HyperFrames 没有 provider 级默认启用；需要使用时，在目标中转站启动的 `/plugins` 中启用
-并正常退出，开启状态只保存给该 provider。若要显式关闭某个中转站，也可以在其 CC Switch
-配置中设置：
+从全局文件删除插件条目表示不再声明该值，不等于禁用：如果项目默认列表仍启用它，下次
+启动会继承这个默认值。要修改所有 provider 的默认值，请在共享 `config.toml` 设置：
 
 ```toml
 [plugins."superpowers@openai-api-curated"]
 enabled = false
 ```
 
-已有 `/plugins` 覆盖的优先级高于 CC Switch 配置；开关在启动器退出时才保存，未退出的
+已有 `/plugins` 覆盖的优先级高于共享配置；开关在启动器退出时才保存，未退出的
 窗口中的操作尚不会作用于新窗口。旧版启动器卸载插件时会清除关闭记录，更新代码无法恢复
 已经丢失的选择，需要重新关闭一次。直接从 Codex 桌面应用或普通 `codex` 启动的会话操作
 插件，不会写入本启动器的 provider 开关。
@@ -148,8 +147,8 @@ enabled = false
 ID。`openai-curated` 完整目录的缓存不会被当作 launcher 的已安装 inventory，避免把其中的
 Figma、GitHub、HyperFrames 或另一份 Superpowers 错误注入当前 provider 配置。
 
-如果只想清除某个 provider 通过启动器保存的插件开关，让它重新采用 provider 配置与
-Common Config 的默认值，可以使用：
+如果只想清除某个 provider 通过启动器保存的插件开关，让它重新采用当前共享默认值，
+可以使用：
 
 ```bash
 python3 codex_tui.py --cc-switch-config fengwind --reset-plugin-state
@@ -161,9 +160,12 @@ tokens 的复杂认证配置；不支持的配置会在启动 Codex 前安全退
 所以不允许在转发参数中再次使用 `--profile` 或 `-p`；`--model` 和 `-c/--config` 等其他
 Codex 参数仍可正常传递。
 
-### 按 provider 添加 MCP
+### MCP：共享配置与 provider 专属配置
 
-直接编辑某个 provider 的 MCP 配置：
+所有 provider 共用的 MCP，请直接在 CC Switch 或 `~/.codex/config.toml` 中管理，启动器
+会在下次启动时读取。只有某个 provider 需要独立声明时，才使用下面的命令。
+
+直接编辑某个 provider 的专属 MCP 配置：
 
 ```bash
 python3 codex_tui.py --cc-switch-config lanln --edit-mcp
@@ -221,17 +223,13 @@ python3 codex_tui.py --cc-switch-config lanln -- mcp list
 已启动窗口使用启动时的配置，添加或删除后需要重启该窗口；进入后可用 `/mcp verbose`
 查看连接状态和工具。资源列表为空不代表 MCP 未连接：MCP 可以只提供工具。
 
-CC Switch 4.0.5 的 provider 编辑器显示的是该 provider 投影到全局配置后的结果；编辑
-`mcp_servers` 实际修改的是 `~/.codex/config.toml`，不会添加或删除该 provider 数据库中的
-MCP 声明。因此，按 provider 管理 MCP 请使用上述启动器命令；在原编辑器中看到或删掉
-MCP，并不代表启动器使用的 provider 声明已变化。
+所有 provider 共用的 MCP 直接在 CC Switch MCP 页面或共享 `~/.codex/config.toml` 中管理，
+也可以直接运行 `codex mcp add/remove`。启动器下次启动会自动读取，无需 `--edit-mcp`。
 
-启动器从 provider 配置及已启用的 Common Config 合并 `mcp_servers`，不会自动继承
-`~/.codex/config.toml` 或 CC Switch MCP 管理页中的全局声明。需要按 provider 独立增删的
-MCP 应保存在 provider 中。放在 Common Config 的 MCP 会继续对开启 `Apply Common Config`
-的 provider 生效，`mcp remove` 只删 provider 声明，不删除 Common Config。
-显式保存仅适用于上述启动器的 `mcp add/remove`；另一个终端直接运行 `codex mcp add`
-使用那个终端自己的 Codex home，不会保存到本启动器的 provider。
+`--edit-mcp` 和上述 `-- mcp add/remove` 仅用于 provider 专属声明。启动时先读取全局 MCP，
+再叠加 provider 的 MCP；同名服务器整项由 provider 覆盖，避免混用另一份配置的凭证。
+删除 provider 声明会重新继承同名全局服务器，不会删除全局 MCP。若要只对某个 provider
+禁用全局服务器，可在其专属声明中设置 `enabled = false`。
 
 ### HyperFrames：统一从插件入口使用
 
@@ -302,34 +300,24 @@ ln -s ~/.local/share/cometix-claude/node_modules/.bin/claude ~/.local/bin/cometi
 cometix 需要 Node.js 24 或更新版本，与官方版本使用同一个 `CLAUDE_CONFIG_DIR`（默认
 `~/.claude`）。
 
-Claude 启动器和 selector 评测不读取用户级 `~/.claude/settings.json` 的其他内容，这一点
-与 Codex 启动器相同；唯一的例外是下文的 `CLAUDE_CODE_EFFORT_LEVEL`。最终配置来自 CC Switch：
-先取 provider 原始配置；仅当该 provider 在 CC Switch 中开启 `Apply Common Config` 时，再把
-Claude Common Config 递归合并上去。合并规则与 CC Switch App 一致：对象（如 `env`、
-`enabledPlugins`）按键合并，数组和标量整体替换，同名值以 Common Config 为准。未开启
-`Apply Common Config` 的 provider 完全不会并入 Common Config。Common Config 为空时不产生
-任何效果；开启后若它缺失或不是 JSON 对象，启动会报错退出，且错误信息不包含配置内容。
+Claude 启动器和 selector 评测每次启动读取共享 `CLAUDE_CONFIG_DIR/settings.json`
+（默认 `~/.claude/settings.json`）。插件、hooks、权限、statusLine 和普通环境变量等全局
+设置以这个文件为准；地址、凭证、模型和供应商兼容参数来自所选 provider。当前全局文件
+中的另一家 provider 的连接字段不会带入。数据库里的旧 `common_config_claude` 和
+`commonConfigEnabled` 已不再使用，供应商行中遗留的插件、hooks 等全局字段也不会恢复。
 
-因此，所有 provider 共用的设置，例如 `DISABLE_AUTOUPDATER`，以及 cometix patcher 中靠环境
-变量开启的补丁（如 `CLAUDE_CLASSIFIER_MODEL`、`CLAUDE_CODE_CONTEXT_LIMIT`），应写进
-CC Switch 的 Claude Common Config 的 `env`，或写进单个 provider 的 `env`。只写在
-`~/.claude/settings.json` 中不会生效，也可以在 shell 中直接导出。启动器会把合并后的 `env`
-同时注入 Claude 子进程，因此在进程启动时读取环境变量的补丁也能拿到这些值。直接改写安装
-文件的补丁不受影响。新版 CC Switch App 切换 Claude provider 时已不再合并 Common Config，
-但仍保存这段配置和 provider 的开关，本启动器继续按这两项生效。
-
-`CLAUDE_CODE_EFFORT_LEVEL` 是个例外。CC Switch App 把它当作所有 provider 共用的全局设置：
-在编辑面板里修改时只写进 `~/.claude/settings.json`，provider 数据库记录中的旧值不会更新。
-因此这一项优先取 `~/.claude/settings.json` 的 `env`，对所有 provider 生效；这里没有或为空
-时才用 provider 自身或已合并的 Common Config。这个文件不存在时直接回退；文件无法读取或不是
-JSON 对象时，启动会报错退出，且错误信息不包含配置内容。
+共用的 `DISABLE_AUTOUPDATER`、`CLAUDE_CODE_EFFORT_LEVEL`，以及 cometix 的环境变量补丁
+（如 `CLAUDE_CLASSIFIER_MODEL`、`CLAUDE_CODE_CONTEXT_LIMIT`），请在共享 `settings.json`
+的 `env` 中设置，或在 shell 中导出。合并后的 `env` 会注入 Claude 子进程，启动时读取
+环境变量的补丁也能生效。文件不存在时使用空的共享设置；文件损坏或无法读取会报错，
+不会回退到数据库中的旧片段。
 
 Claude Code 还把这个环境变量当作整个会话的强制值，设置后 `/effort` 只会提示
 `CLAUDE_CODE_EFFORT_LEVEL=max overrides this session`，无法切换。因此启动器会把上述来源中
 取值为 `low`、`medium`、`high`、`xhigh` 或 `max` 的这一项从 `env` 中移除，改为启动参数
 `--effort`。它只决定会话的初始强度，进入后仍可以用 `/effort` 随时切换，与 Codex 中
-`model_reasoning_effort` 作为默认值的用法一致。`/effort` 保存到 `modelSettings` 的默认值
-不会被启动器读取，要改默认值请改 `CLAUDE_CODE_EFFORT_LEVEL`。转发参数中显式传入的
+`model_reasoning_effort` 作为默认值的用法一致。共享文件中的 `effortLevel` 和 `modelSettings` 也会随用户设置载入；需要显式指定启动
+强度时，可设置 `CLAUDE_CODE_EFFORT_LEVEL`。转发参数中显式传入的
 `--effort` 优先；`auto`、`unset` 等 `--effort` 不接受的取值保持原样留在 `env` 中。在 shell
 中导出的 `CLAUDE_CODE_EFFORT_LEVEL` 不会被改动，仍会锁定整个会话。selector 评测也按同样
 规则处理：未传 `-r` 时使用这个值，传了 `-r` 则以 `-r` 为准，不会再被它悄悄覆盖。
@@ -344,15 +332,12 @@ Claude Code 还把这个环境变量当作整个会话的强制值，设置后 `
 共享目录。子进程设置了 `CLAUDE_SECURESTORAGE_CONFIG_DIR`，钥匙串中的凭证条目名与直接
 运行 Claude Code 时相同。
 
-CC Switch 所选 provider 的配置（包括顶层 `env`，以及按上述规则合并的 Common Config，
-`enabledPlugins` 除外）会写入权限为 `0600` 的临时 `provider-settings.json`，同时同一份
-`env` 会注入 Claude 子进程。启动命令固定使用 `--setting-sources user,project,local`：
-user 来源读取的是本窗口自己的 `settings.json`，其中只有下文的插件开关，所以共享
-`~/.claude/settings.json` 的其他内容仍不生效；项目和 local settings 照常读取；优先级更高的
-`--settings` 确保指定 provider 的地址、凭证、模型映射和自定义 headers 最终生效。临时目录
-权限为 `0700`，token、地址和 headers 不会进入命令行、日志或公开错误；临时目录仅在 Claude
-进程运行期间存在，正常退出、异常、Ctrl-C 或 SIGTERM 后都会清理。清理只删除链接，不会删除
-共享目录中的内容。
+共享设置复制进本窗口的 `settings.json`，插件开关再叠加该 provider 保存的选择。所选
+provider 的连接配置写入 `provider-settings.json`，通过 `--settings` 加载。启动命令固定
+使用 `--setting-sources user,project,local`，共享设置仍在 user 层，项目和 local settings
+照常覆盖用户设置；更高优先级的 `--settings` 确保所选 provider 的地址、凭证、模型映射和
+headers 生效。两份临时文件权限为 `0600`，目录为 `0700`；凭证不会进入命令行或公开错误。
+正常退出、异常、Ctrl-C 或 SIGTERM 后清理临时目录，保留共享状态。
 
 交互启动器支持包含非空 `ANTHROPIC_BASE_URL`，且仅包含
 `ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_API_KEY` 二者之一的 CC Switch 中转站配置。
@@ -368,8 +353,9 @@ provider 隔离并在任意目录生效：启动器把它单独写入临时 `mcp
 会话。注意 `claude mcp list` 只列持久化配置，不显示 `--mcp-config` 注入的 server；
 会话内用 `/mcp` 查看连接状态。
 
-CC Switch App 4.x 把 Claude provider 的 `mcpServers` 当作全局/legacy 字段隐藏，无法
-在 App 里按 provider 管理。增删某个 Claude provider 的 MCP 请用启动器：
+所有 provider 共用的 Claude MCP 直接通过 CC Switch MCP 页面或 Claude 的全局 MCP
+命令管理；共享 `.claude.json` 中的声明会由所有窗口读取，无需 `--edit-mcp`。
+只有需要按 provider 保存独立 MCP 时，才使用启动器：
 
 ```bash
 python3 claude_tui.py --cc-switch-config anyrouter --edit-mcp
@@ -382,7 +368,7 @@ python3 claude_tui.py --cc-switch-config anyrouter --edit-mcp
 目录权限为 `0700`，备份文件为 `0600`。
 
 评测脚本通过 selector 运行时会在启动时读取一次配置，并写入权限为 owner-only 的临时
-目录：Codex 评测使用临时 `CODEX_HOME`，Claude candy 评测使用临时
+目录，共享设置与上述启动器使用相同来源：Codex 评测使用临时 `CODEX_HOME`，Claude candy 评测使用临时
 `CLAUDE_CONFIG_DIR`。评测期间不会调用 `cc-switch`
 CLI，不会切换或写入 App 当前配置，也不会修改默认的 `~/.codex` 或 `~/.claude`；进程结束、
 异常、Ctrl-C 或收到 SIGTERM 后会清理临时目录。
@@ -395,26 +381,31 @@ selector 模式目前只支持 macOS/Linux。原有不带 selector 的命令在 
 
 在启动器窗口中用 `/plugin` 启用或禁用插件，再运行 `/reload-plugins`，即可当场生效。
 正常退出时，这些变化只为当前 provider 保存，下次启动该 provider 时继续生效，其他 provider
-不受影响。例如，在 `ultrarouter` 窗口中禁用 superpowers 并退出后，`ultrarouter` 以后都
-不再加载它，`linxi` 仍按 Common Config 加载。
+不受影响。共享 `settings.json` 提供所有 provider 的插件默认值。
 
-插件开关的优先级从低到高依次为：provider 配置的 `enabledPlugins`、开启
-`Apply Common Config` 时的 Common Config、该 provider 通过 `/plugin` 保存的开关。保存位置
-是共享 Claude 目录下的 `.cc-switch-tui/provider-plugins/`。这里只记录与前两层不同的项，改回
-默认值后自动删除；不写 CC Switch 数据库，也不写 `~/.claude/settings.json`。多个窗口退出时
-只合并各自实际改动的插件，未操作插件的窗口不会覆盖其他窗口的选择。开关在退出时才保存，
-对已经在运行的其他窗口不生效。
+插件开关的优先级从低到高为：共享 `settings.json` 的 `enabledPlugins`、该 provider
+通过 `/plugin` 保存的开关。保存位置是共享 Claude 目录下的
+`.cc-switch-tui/provider-plugins/`，只记录与共享默认值不同的项，改回默认值后自动删除。
+不写 CC Switch 数据库或共享 `settings.json`。多个窗口退出时只合并各自实际改动的插件；
+开关在退出时保存，对已经运行的其他窗口不生效。
 
-要清除某个 provider 保存的插件开关、回到 provider 配置与 Common Config 的默认值：
+要清除某个 provider 保存的插件开关、回到当前共享默认值：
 
 ```bash
 python3 claude_tui.py --cc-switch-config ultrarouter --reset-plugin-state
 ```
 
 插件的安装和卸载仍是全局的。卸载会清除所有 provider 保存的启用记录；如果当前 provider
-的默认值是启用，还会为它保存一条禁用记录。只要还有某个 provider 的默认值启用该插件，以该
-provider 启动时 Claude Code 就会自动重新安装它；要对所有 provider 停用某个插件，请从
-Common Config 中删除它。
+的默认值是启用，还会为它保存一条禁用记录。每次启动时，启动器会检查共享安装记录，
+只把仍已安装的插件开关写入窗口配置。已卸载插件留下的 `true`、`false` 或版本约束都
+不会再写进去，避免自动重装或 cometix 的“failed to load”残留提示，无需手动清理。
+共享默认值和 provider 的关闭偏好仍保留；以后在 `/plugin` 中主动重新安装时会重新适用。
+仅在全局配置中写 `true` 不再代替安装操作。
+
+已运行的其他窗口保留旧配置，卸载后应退出并重新启动。项目/local settings 或管理策略
+中的独立插件声明仍由 Claude 读取，不在上述自动过滤范围内。若只想全局停用而不卸载，
+请在共享 `settings.json` 中把插件的 `enabledPlugins` 值设为 `false`，并清除之前保存的
+provider 启用覆盖。安装记录损坏或无法读取时，启动器会报错而不猜测插件状态。
 
 窗口中修改的其他用户级设置（例如 `/theme`、`/statusline` 或 `/model` 的默认值）只对当前
 窗口有效，退出后丢弃。用户级 skills、agents、commands 和 `CLAUDE.md` 与直接运行 Claude

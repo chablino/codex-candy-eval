@@ -191,8 +191,8 @@ class ProviderMcpTests(unittest.TestCase):
             with use_codex_runtime(name, db_path=self.db_path) as runtime:
                 servers = tomllib.loads(runtime.config_path.read_text())["mcp_servers"]
                 self.assertEqual("dbx" in servers, name == "one")
-                self.assertIn("shared", servers)  # Common Config still applies at launch
-                self.assertNotIn("global", servers)
+                self.assertNotIn("shared", servers)  # Frozen DB snippet is ignored
+                self.assertIn("global", servers)
                 self.assertEqual(runtime.environment["OPENAI_API_KEY"], "private-test-key")
 
     def test_concurrent_model_auth_and_other_mcp_edits_are_preserved(self):

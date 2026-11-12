@@ -115,8 +115,6 @@ def plugin_flags(document: Mapping[str, Any]) -> dict[str, bool]:
 
 def compose_effective_config(
     provider: Mapping[str, Any],
-    common: Mapping[str, Any] | None,
-    common_enabled: bool,
     launcher_marketplaces: Mapping[str, Any],
     inventory: set[str] | frozenset[str],
     provider_plugins: Mapping[str, bool],
@@ -133,18 +131,10 @@ def compose_effective_config(
     }
 
     document = deepcopy(dict(provider))
-    if common_enabled and common is not None:
-        document = deep_merge(document, common)
 
     plugins = installed_defaults
-    plugin_layers = [_normalized_plugin_entries(provider)]
-    if common_enabled and common is not None:
-        plugin_layers.append(_normalized_plugin_entries(common))
-    for layer in plugin_layers:
-        for plugin_id, entry in layer.items():
-            plugins[plugin_id] = deep_merge(
-                plugins.get(plugin_id, {}), entry
-            )
+    for plugin_id, entry in _normalized_plugin_entries(provider).items():
+        plugins[plugin_id] = deep_merge(plugins.get(plugin_id, {}), entry)
 
     baseline_plugins = {
         plugin_id: entry.get("enabled", True)

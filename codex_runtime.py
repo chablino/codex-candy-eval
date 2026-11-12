@@ -24,8 +24,8 @@ from cc_switch_config import (
     SelectedProvider,
     _sigterm_as_system_exit,
     _write_private_file,
-    load_common_config,
     load_provider,
+    read_codex_live_config,
 )
 from codex_plugin_state import (
     CANONICAL_SUPERPOWERS_ID,
@@ -33,12 +33,12 @@ from codex_plugin_state import (
     PluginStateStore,
     RuntimeSnapshot,
     compose_effective_config,
-    deep_merge,
     normalize_plugin_id,
     plugin_flags,
     scan_plugin_inventory,
 )
 from codex_local_skills import apply_local_skill_policy
+from provider_settings import codex_settings
 
 
 DIRECTORY_SHARE_ALLOWLIST = (
@@ -156,31 +156,6 @@ def _existing_directory(
     if inspection_failed or resolved is None:
         raise CcSwitchConfigError(f"{key} must refer to an existing directory")
     return resolved
-
-
-def _read_shared_config(shared_home: Path) -> dict[str, Any]:
-    path = shared_home / "config.toml"
-    if not path.exists() and not path.is_symlink():
-        return {}
-    payload = ""
-    read_failed = False
-    try:
-        if path.is_symlink() or not path.is_file():
-            raise OSError("shared config is not a regular file")
-        payload = path.read_text(encoding="utf-8")
-    except OSError:
-        read_failed = True
-    if read_failed:
-        raise CcSwitchConfigError("shared Codex configuration is invalid")
-
-    parsed: dict[str, Any] | None = None
-    try:
-        parsed = tomllib.loads(payload)
-    except (tomllib.TOMLDecodeError, RecursionError):
-        pass
-    if parsed is None:
-        raise CcSwitchConfigError("shared Codex configuration is invalid")
-    return parsed
 
 
 def _load_default_plugin_config() -> dict[str, bool]:
@@ -715,7 +690,6 @@ def _cleanup_temporary_directory(
 
 def _prepare_codex_runtime(
     provider: SelectedProvider,
-    common_config: str | None,
     *,
     reset_plugin_state: bool = False,
 ) -> _PreparedCodexRuntime:
@@ -739,16 +713,9 @@ def _prepare_codex_runtime(
         )
 
         provider_document = _parse_toml(provider.settings.get("config"))
-        common_document = (
-            _parse_toml(common_config) if common_config is not None else None
-        )
-        shared_document = _read_shared_config(shared_home)
+        shared_document = read_codex_live_config(shared_home)
         default_plugins = _load_default_plugin_config()
-        baseline_document = (
-            deep_merge(provider_document, common_document)
-            if common_document is not None
-            else deepcopy(provider_document)
-        )
+        baseline_document = codex_settings(provider_document, shared_document)
 
         targets = _prepare_shared_targets(shared_home)
         shared_plugins = targets["plugins"]
@@ -764,9 +731,7 @@ def _prepare_codex_runtime(
         )
         inventory = scan_plugin_inventory(shared_plugins)
         composed = compose_effective_config(
-            provider_document,
-            common_document,
-            common_document is not None,
+            baseline_document,
             launcher_marketplaces,
             inventory,
             provider_plugins,
@@ -905,14 +870,12 @@ def _synchronize_runtime_sessions_safely(
 @contextmanager
 def materialize_codex_runtime(
     provider: SelectedProvider,
-    common_config: str | None,
     *,
     reset_plugin_state: bool = False,
 ) -> Iterator[CodexRuntime]:
     """Materialize one complete Codex configuration in a temporary home."""
     prepared = _prepare_codex_runtime(
         provider,
-        common_config,
         reset_plugin_state=reset_plugin_state,
     )
     body_failed = False
@@ -953,15 +916,9 @@ def use_codex_runtime(
         )
 
     provider = load_provider("codex", selector, db_path)
-    common_config = (
-        load_common_config("codex", db_path)
-        if provider.meta.get("commonConfigEnabled") is True
-        else None
-    )
     with _sigterm_as_system_exit():
         with materialize_codex_runtime(
             provider,
-            common_config,
             reset_plugin_state=reset_plugin_state,
         ) as runtime:
             yield runtime

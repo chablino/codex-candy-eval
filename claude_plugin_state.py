@@ -49,10 +49,33 @@ def enabled_view(plugins: Mapping[str, Any]) -> dict[str, bool]:
 def effective_plugins(
     baseline: Mapping[str, Any], saved: Mapping[str, bool]
 ) -> dict[str, Any]:
-    """Overlay saved switches on the provider/Common Config baseline."""
+    """Overlay saved switches on the live shared-settings baseline."""
     effective = deepcopy(dict(baseline))
     effective.update(saved)
     return effective
+
+
+def installed_plugin_settings(
+    plugins: Mapping[str, Any], installed: frozenset[str] | None
+) -> dict[str, Any]:
+    """Omit uninstalled plugins from window settings without erasing preferences.
+
+    Claude can report a missing install even for a false enabledPlugins entry.
+    True entries can trigger installation again. Installation must be explicit;
+    neither kind of stale preference belongs in a new window's settings.
+    An unreadable registry is not proof of an uninstall: refuse to launch rather
+    than restore stale enables or silently discard the user's plugin settings.
+    """
+    if installed is None:
+        raise ClaudePluginStateError(
+            "Claude plugin installation record could not be read; "
+            "plugin settings were not changed"
+        )
+    return {
+        plugin_id: deepcopy(value)
+        for plugin_id, value in plugins.items()
+        if plugin_id in installed
+    }
 
 
 def read_installed_plugins(plugins_root: Path) -> frozenset[str] | None:
@@ -66,10 +89,15 @@ def read_installed_plugins(plugins_root: Path) -> frozenset[str] | None:
     except (OSError, UnicodeDecodeError, ValueError, RecursionError):
         return None
     plugins = payload.get("plugins") if isinstance(payload, dict) else None
-    if not isinstance(plugins, dict):
+    if not isinstance(plugins, dict) or any(
+        not isinstance(plugin_id, str)
+        or not isinstance(records, list)
+        or any(not isinstance(record, dict) for record in records)
+        for plugin_id, records in plugins.items()
+    ):
         return None
     return frozenset(
-        plugin_id for plugin_id in plugins if isinstance(plugin_id, str)
+        plugin_id for plugin_id, records in plugins.items() if records
     )
 
 
@@ -306,6 +334,10 @@ class ClaudePluginStateStore:
             latest = sidecars[current_path][2]
             for plugin_id in changed:
                 desired = final.plugins.get(plugin_id, False)
+                # A stale window can still say enabled after another window
+                # uninstalls the shared files. Never save that as a new enable.
+                if final.installed is not None and plugin_id not in final.installed:
+                    desired = False
                 # Uninstall deletes the window's entry, so a baseline-enabled
                 # plugin is saved as disabled instead of coming back.
                 if desired == baseline_view.get(plugin_id, False):
